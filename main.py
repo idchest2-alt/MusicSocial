@@ -362,14 +362,16 @@ def _ensure_col(table, column, definition):
         )
 
 Base.metadata.create_all(bind=engine)
-_ensure_col("posts", "views", "INTEGER DEFAULT 0")
-_ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
-_ensure_col("users", "referral_code", "VARCHAR")
-_ensure_col("users", "referred_by_user_id", "INTEGER")
-_ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
-_ensure_col("sessions", "expires_at", "DATETIME")
-_ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
-_ensure_col("users", "last_seen_at", "DATETIME")
+
+if DATABASE_URL.startswith("sqlite"):
+    _ensure_col("posts", "views", "INTEGER DEFAULT 0")
+    _ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
+    _ensure_col("users", "referral_code", "VARCHAR")
+    _ensure_col("users", "referred_by_user_id", "INTEGER")
+    _ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
+    _ensure_col("sessions", "expires_at", "DATETIME")
+    _ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
+    _ensure_col("users", "last_seen_at", "DATETIME")
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
