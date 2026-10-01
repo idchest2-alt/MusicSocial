@@ -1506,23 +1506,77 @@ def rewards(authorization: str | None = Header(default=None)):
         db.close()
 
 @app.post("/coins/transfer")
-def transfer_coins(recipient_username: str = Form(...), coins: int = Form(...), note: str = Form(""),
-                  authorization: str | None = Header(default=None)):
-    user = current_user(authorization); coins = int(coins)
-    if coins <= 0: raise HTTPException(400, "Enter more than 0 coins.")
+def transfer_coins(
+    recipient_username: str = Form(...),
+    coins: int = Form(...),
+    note: str = Form(""),
+    authorization: str | None = Header(default=None)
+):
+    user = current_user(authorization)
+    coins = int(coins)
+
+    if coins <= 0:
+        raise HTTPException(400, "Enter more than 0 coins.")
+
     db = SessionLocal()
     try:
-        recipient = db.query(User).filter(User.username == _uname(recipient_username)).first()
-        if not recipient: raise HTTPException(404, "That username was not found.")
-        if recipient.id == user.id: raise HTTPException(400, "You cannot send coins to yourself.")
+        recipient = db.query(User).filter(
+            User.username == _uname(recipient_username)
+        ).first()
+
+        if not recipient:
+            raise HTTPException(404, "That username was not found.")
+
+        if recipient.id == user.id:
+            raise HTTPException(400, "You cannot send coins to yourself.")
+
         sender = db.query(User).filter(User.id == user.id).first()
+
         ref, paid = _spend_coins(sender, coins)
-        if is_owner(sender): paid = coins
+
+        if is_owner(sender):
+            paid = coins
+
+        # Add the received coins to the recipient's normal balance
         recipient.referral_coins = (recipient.referral_coins or 0) + ref
         recipient.credits = (recipient.credits or 0) + paid
-        db.add(CoinTransfer(sender_id=sender.id, recipient_id=recipient.id, coins=coins, note=note[:160]))
-        _notify(db, recipient.id, f"{sender.username} sent you {coins} coins"); db.commit()
-        return {"success": True, "credits": public_credits(sender), "recipient": recipient.username}
+
+        # Make transferred coins withdrawable creator earnings
+        db.add(
+            CreatorGift(
+                sender_id=sender.id,
+                recipient_id=recipient.id,
+                room_id=None,
+                coins=coins,
+                withdrawable_coins=paid,
+                gift_name="Coin Transfer"
+            )
+        )
+
+        # Keep a record of the transfer
+        db.add(
+            CoinTransfer(
+                sender_id=sender.id,
+                recipient_id=recipient.id,
+                coins=coins,
+                note=note[:160]
+            )
+        )
+
+        _notify(
+            db,
+            recipient.id,
+            f"{sender.username} sent you {coins} coins"
+        )
+
+        db.commit()
+
+        return {
+            "success": True,
+            "credits": public_credits(sender),
+            "recipient": recipient.username
+        }
+
     finally:
         db.close()
 
