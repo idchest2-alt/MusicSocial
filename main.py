@@ -1047,9 +1047,15 @@ def verify_paystack(reference: str, authorization: str | None = Header(default=N
             return {"success": True, "paid": False, "status": tx.status}
         if int(pay.get("amount") or 0) != tx.amount_naira * 100 or pay.get("currency") != "NGN":
             raise HTTPException(400, "Payment amount does not match this package.")
-       added = _fulfill_payment(db, tx, pay); db.commit()
-        return {"success": True, "paid": True, "already_fulfilled": not added,
-                "credits_added": tx.credits if added else 0, "credits": public_credits(user), "reference": reference}
+       added = _fulfill_payment(db, tx, pay)
+db.commit()
+
+fresh_user = db.query(User).filter(User.id == tx.user_id).first()
+
+return {"success": True, "paid": True, "already_fulfilled": not added,
+        "credits_added": tx.credits if added else 0,
+        "credits": public_credits(fresh_user),
+        "reference": reference}
     finally:
         db.close()
 
