@@ -1,6 +1,7 @@
 fastapi
-uvicorn[standard]
+uvicorn
 sqlalchemy
-python-multipart
 python-dotenv
 httpx
+python-multipart
+psycopg[binary]
