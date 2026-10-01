@@ -1,12 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
 from pathlib import Path
-import hashlib, secrets, uuid, re, os, json, hmac
+import hashlib, secrets, uuid, re, os, json, hmac, math
 from typing import Optional
 import httpx
 from dotenv import load_dotenv
@@ -23,8 +22,10 @@ OWNER_USERNAME = os.getenv("MUSICSOCIAL_OWNER_USERNAME", "").strip()
 if OWNER_USERNAME and not OWNER_USERNAME.startswith("@"):
     OWNER_USERNAME = "@" + OWNER_USERNAME
 
-CREATOR_COIN_NAIRA = 10
-BOOST_COST = 10
+CREATOR_COIN_NAIRA = 6.25
+WITHDRAWAL_COINS = 800
+WITHDRAWAL_NAIRA = 5000
+BOOST_COST = 20
 MUSIC_UPLOAD_COST = 200
 OWNER_PROMO = 999_999_999_999
 
@@ -193,6 +194,9 @@ class WithdrawalRequest(Base):
     bank_name = Column(String, default="")
     account_name = Column(String, default="")
     account_number = Column(String, default="")
+    withdrawable_coins = Column(Integer, default=0)
+    paid_at = Column(DateTime, nullable=True)
+    owner_note = Column(String, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class MusicTrack(Base):
@@ -336,42 +340,32 @@ class UserActivity(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 def _ensure_col(table, column, definition):
-    """Add a missing legacy column without assuming SQLite.
-
-    The original app used PRAGMA table_info(), which is SQLite-specific.
-    Railway may use SQLite or PostgreSQL, so use SQLAlchemy's inspector instead.
-    """
-    from sqlalchemy import inspect
-
-    inspector = inspect(engine)
-    if table not in inspector.get_table_names():
-        return
-
-    columns = {col["name"] for col in inspector.get_columns(table)}
-    if column in columns:
-        return
-
-    # PostgreSQL uses TIMESTAMP rather than SQLite's DATETIME spelling.
-    ddl_definition = definition
-    if engine.dialect.name == "postgresql":
-        ddl_definition = ddl_definition.replace("DATETIME", "TIMESTAMP")
-
     with engine.begin() as conn:
-        conn.exec_driver_sql(
-            f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl_definition}'
-        )
+        existing = {c["name"] for c in inspect(engine).get_columns(table)}
+        if column not in existing:
+            conn.exec_driver_sql(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
 
 Base.metadata.create_all(bind=engine)
+_ensure_col("posts", "views", "INTEGER DEFAULT 0")
+_ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
+_ensure_col("users", "referral_code", "VARCHAR")
+_ensure_col("users", "referred_by_user_id", "INTEGER")
+_ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
+_ensure_col("sessions", "expires_at", "DATETIME")
+_ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
+_ensure_col("users", "last_seen_at", "DATETIME")
+_ensure_col("withdrawal_requests", "withdrawable_coins", "INTEGER DEFAULT 0")
+_ensure_col("withdrawal_requests", "paid_at", "DATETIME")
+_ensure_col("withdrawal_requests", "owner_note", "VARCHAR DEFAULT ''")
 
-if DATABASE_URL.startswith("sqlite"):
-    _ensure_col("posts", "views", "INTEGER DEFAULT 0")
-    _ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
-    _ensure_col("users", "referral_code", "VARCHAR")
-    _ensure_col("users", "referred_by_user_id", "INTEGER")
-    _ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
-    _ensure_col("sessions", "expires_at", "DATETIME")
-    _ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
-    _ensure_col("users", "last_seen_at", "DATETIME")
+# Backfill the coin amount for withdrawal requests created before the new manual-payout system.
+_db_backfill = SessionLocal()
+try:
+    for _w in _db_backfill.query(WithdrawalRequest).filter(WithdrawalRequest.withdrawable_coins == 0).all():
+        _w.withdrawable_coins = int(math.ceil((_w.amount_naira or 0) * WITHDRAWAL_COINS / WITHDRAWAL_NAIRA))
+    _db_backfill.commit()
+finally:
+    _db_backfill.close()
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
@@ -575,119 +569,50 @@ def root():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "owner_configured": bool(OWNER_EMAIL or OWNER_USERNAME),
-        "database": engine.dialect.name,
-        "uploads": str(UPLOAD_DIR),
-    }
+    return {"status": "healthy", "owner_configured": bool(OWNER_EMAIL or OWNER_USERNAME)}
 
 @app.post("/auth/register")
 def register(username: str = Form(...), email: str = Form(...), password: str = Form(...), referral_code: str = Form("")):
-    username = _uname(username)
-    email = email.strip().lower()
-
+    username = _uname(username); email = email.strip().lower()
     if len(username) < 3 or len(username) > 30:
         raise HTTPException(400, "Username must be 3–30 characters.")
     if len(password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters.")
-
     db = SessionLocal()
     try:
-        existing = db.query(User).filter(
-            (User.username == username) | (User.email == email)
-        ).first()
-        if existing:
+        if db.query(User).filter((User.username == username) | (User.email == email)).first():
             raise HTTPException(400, "That username or email is already in use.")
-
         referrer = None
         code = referral_code.strip().upper()
         if code:
             referrer = db.query(User).filter(User.referral_code == code).first()
             if not referrer:
                 raise HTTPException(400, "That referral code is not valid.")
-
-        user = User(
-            username=username,
-            email=email,
-            password_hash=hash_password(password),
-            credits=100,
-            referral_code=("MSC" + secrets.token_hex(5)).upper(),
-            referred_by_user_id=referrer.id if referrer else None,
-        )
-        db.add(user)
-        db.flush()
-
+        user = User(username=username, email=email, password_hash=hash_password(password),
+                    credits=100, referral_code=("MSC" + secrets.token_hex(5)).upper(),
+                    referred_by_user_id=referrer.id if referrer else None)
+        db.add(user); db.commit(); db.refresh(user)
         token = secrets.token_urlsafe(48)
-        db.add(
-            SessionToken(
-                user_id=user.id,
-                token=token,
-                expires_at=datetime.utcnow() + timedelta(days=30),
-            )
-        )
-
+        db.add(SessionToken(user_id=user.id, token=token, expires_at=datetime.utcnow() + timedelta(days=30)))
         if referrer and referrer.id != user.id:
             referrer.referral_coins = (referrer.referral_coins or 0) + 2
-            db.add(
-                Notification(
-                    user_id=referrer.id,
-                    text=f"Referral reward: +2 coins for {user.username}",
-                )
-            )
-            db.add(
-                ReferralReward(
-                    referrer_id=referrer.id,
-                    referred_user_id=user.id,
-                    coins=2,
-                )
-            )
-
+            db.add(Notification(user_id=referrer.id, text=f"Referral reward: +2 coins for {user.username}"))
+            db.add(ReferralReward(referrer_id=referrer.id, referred_user_id=user.id, coins=2))
         db.commit()
-        db.refresh(user)
-        return {
-            "success": True,
-            "token": token,
-            "user": user_json(user),
-            "referral_code": user.referral_code,
-        }
-    except HTTPException:
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(409, "That username or email is already in use.")
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"Registration failed: {type(e).__name__}")
+        return {"success": True, "token": token, "user": user_json(user), "referral_code": user.referral_code}
     finally:
         db.close()
 
 @app.post("/auth/login")
 def login(email: str = Form(...), password: str = Form(...)):
-    email = email.strip().lower()
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == email).first()
+        user = db.query(User).filter(User.email == email.strip().lower()).first()
         if not user or not verify_password(password, user.password_hash):
             raise HTTPException(401, "Incorrect email or password.")
-
         token = secrets.token_urlsafe(48)
-        db.add(
-            SessionToken(
-                user_id=user.id,
-                token=token,
-                expires_at=datetime.utcnow() + timedelta(days=30),
-            )
-        )
-        db.commit()
+        db.add(SessionToken(user_id=user.id, token=token, expires_at=datetime.utcnow() + timedelta(days=30))); db.commit()
         return {"success": True, "token": token, "user": user_json(user)}
-    except HTTPException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"Login failed: {type(e).__name__}")
     finally:
         db.close()
 
@@ -1029,76 +954,27 @@ def _fulfill_payment(db, tx: PaymentTransaction, paystack_data: dict):
 
 @app.get("/payments/paystack/verify/{reference}")
 def verify_paystack(reference: str, authorization: str | None = Header(default=None)):
-    auth_user = current_user(authorization)
-
+    user = current_user(authorization)
     db = SessionLocal()
     try:
-        tx = db.query(PaymentTransaction).filter(
-            PaymentTransaction.reference == reference,
-            PaymentTransaction.user_id == auth_user.id
-        ).first()
-
-        if not tx:
-            raise HTTPException(404, "Payment not found.")
-
+        tx = db.query(PaymentTransaction).filter(PaymentTransaction.reference == reference, PaymentTransaction.user_id == user.id).first()
+        if not tx: raise HTTPException(404, "Payment not found.")
         try:
-            response = httpx.get(
-                f"{PAYSTACK_BASE_URL}/transaction/verify/{reference}",
-                headers=_paystack_headers(),
-                timeout=30.0
-            )
+            response = httpx.get(f"{PAYSTACK_BASE_URL}/transaction/verify/{reference}", headers=_paystack_headers(), timeout=30.0)
             data = response.json()
         except Exception as exc:
             raise HTTPException(502, f"Could not verify payment: {exc}")
-
         pay = data.get("data") or {}
-
         if response.status_code >= 400 or not data.get("status"):
-            raise HTTPException(
-                400,
-                data.get("message", "Payment verification failed.")
-            )
-
+            raise HTTPException(400, data.get("message", "Payment verification failed."))
         if pay.get("status") != "success":
-            tx.status = pay.get("status", "pending")
-            db.commit()
-
-            return {
-                "success": True,
-                "paid": False,
-                "status": tx.status
-            }
-
-        if int(pay.get("amount") or 0) != tx.amount_naira * 100:
-            raise HTTPException(
-                400,
-                "Payment amount does not match this package."
-            )
-
-        if pay.get("currency") != "NGN":
-            raise HTTPException(
-                400,
-                "Payment currency does not match this package."
-            )
-
-        added = _fulfill_payment(db, tx, pay)
-        db.commit()
-
-        fresh_user = db.query(User).filter(
-            User.id == tx.user_id
-        ).first()
-
-        credits = public_credits(fresh_user)
-
-        return {
-            "success": True,
-            "paid": True,
-            "already_fulfilled": not added,
-            "credits_added": tx.credits if added else 0,
-            "credits": credits,
-            "reference": reference
-        }
-
+            tx.status = pay.get("status", "pending"); db.commit()
+            return {"success": True, "paid": False, "status": tx.status}
+        if int(pay.get("amount") or 0) != tx.amount_naira * 100 or pay.get("currency") != "NGN":
+            raise HTTPException(400, "Payment amount does not match this package.")
+        added = _fulfill_payment(db, tx, pay); db.commit(); db.refresh(user)
+        return {"success": True, "paid": True, "already_fulfilled": not added,
+                "credits_added": tx.credits if added else 0, "credits": public_credits(user), "reference": reference}
     finally:
         db.close()
 
@@ -1410,6 +1286,26 @@ def admin_dashboard(authorization: str | None = Header(default=None)):
     try:
         paid = db.query(PaymentTransaction).filter(PaymentTransaction.status == "success").all()
         promos = db.query(Promotion).all()
+        rows = db.query(WithdrawalRequest).filter(
+            WithdrawalRequest.status.in_(["pending", "approved"])
+        ).order_by(WithdrawalRequest.id.desc()).limit(200).all()
+        withdrawal_rows = []
+        for r in rows:
+            u = db.query(User).filter(User.id == r.user_id).first()
+            withdrawal_rows.append({
+                "id": r.id,
+                "user_id": r.user_id,
+                "username": u.username if u else "",
+                "amount_naira": r.amount_naira,
+                "fee_naira": r.fee_naira,
+                "net_naira": r.net_naira,
+                "withdrawable_coins": r.withdrawable_coins or 0,
+                "bank_name": r.bank_name or "",
+                "account_name": r.account_name or "",
+                "account_number": r.account_number or "",
+                "status": r.status,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            })
         return {
             "success": True, "owner": user_json(user),
             "owner_promotional_credits": OWNER_PROMO, "revenue_naira": sum(t.amount_naira for t in paid),
@@ -1418,7 +1314,52 @@ def admin_dashboard(authorization: str | None = Header(default=None)):
             "referral_rewards": db.query(ReferralReward).count(),
             "gift_coins_sent": sum(g.coins for g in db.query(CreatorGift).all()),
             "withdrawal_requests": db.query(WithdrawalRequest).count(),
+            "pending_withdrawals": withdrawal_rows,
         }
+    finally:
+        db.close()
+
+@app.post("/admin/withdrawals/{withdrawal_id}/pay")
+def admin_pay_withdrawal(withdrawal_id: int, note: str = Form(""), authorization: str | None = Header(default=None)):
+    owner = current_user(authorization)
+    if not is_owner(owner): raise HTTPException(403, "Owner access required.")
+    db = SessionLocal()
+    try:
+        row = db.query(WithdrawalRequest).filter(WithdrawalRequest.id == withdrawal_id).first()
+        if not row: raise HTTPException(404, "Withdrawal request not found.")
+        if row.status not in {"pending", "approved"}:
+            raise HTTPException(400, f"This withdrawal is already {row.status}.")
+
+        # Marking it paid consumes its reserved withdrawable coins from the user's available balance.
+        # The earnings ledger remains intact for history; available earnings are reduced by this paid ledger entry.
+        row.status = "paid"
+        row.paid_at = datetime.utcnow()
+        row.owner_note = note.strip()[:500]
+        recipient = db.query(User).filter(User.id == row.user_id).first()
+        if recipient:
+            _notify(db, recipient.id, f"Your withdrawal of ₦{row.net_naira:,} has been paid. ₦{row.fee_naira:,} withdrawal fee was applied.")
+        db.commit()
+        return {"success": True, "id": row.id, "status": row.status, "withdrawable_coins_deducted": row.withdrawable_coins or 0}
+    finally:
+        db.close()
+
+@app.post("/admin/withdrawals/{withdrawal_id}/reject")
+def admin_reject_withdrawal(withdrawal_id: int, note: str = Form(""), authorization: str | None = Header(default=None)):
+    owner = current_user(authorization)
+    if not is_owner(owner): raise HTTPException(403, "Owner access required.")
+    db = SessionLocal()
+    try:
+        row = db.query(WithdrawalRequest).filter(WithdrawalRequest.id == withdrawal_id).first()
+        if not row: raise HTTPException(404, "Withdrawal request not found.")
+        if row.status not in {"pending", "approved"}:
+            raise HTTPException(400, f"This withdrawal is already {row.status}.")
+        row.status = "rejected"
+        row.owner_note = note.strip()[:500]
+        recipient = db.query(User).filter(User.id == row.user_id).first()
+        if recipient:
+            _notify(db, recipient.id, f"Your withdrawal request for ₦{row.amount_naira:,} was rejected. Your withdrawable coins were not deducted.")
+        db.commit()
+        return {"success": True, "id": row.id, "status": row.status}
     finally:
         db.close()
 
@@ -1484,12 +1425,24 @@ def creator_earnings(authorization: str | None = Header(default=None)):
         videos = db.query(Post).filter(Post.user_id == user.id).all()
         gifts = db.query(CreatorGift).filter(CreatorGift.recipient_id == user.id).all()
         promos = db.query(Promotion).filter(Promotion.user_id == user.id).all()
+        gross_earnings = sum(g.withdrawable_coins or 0 for g in gifts)
+        reserved = sum(
+            r.withdrawable_coins or 0
+            for r in db.query(WithdrawalRequest).filter(
+                WithdrawalRequest.user_id == user.id,
+                WithdrawalRequest.status.in_(["pending", "approved", "paid"])
+            ).all()
+        )
+        available_earnings = max(0, gross_earnings - reserved)
         return {"success": True, "credits": public_credits(user), "videos": len(videos),
                 "likes": sum(p.likes or 0 for p in videos), "comments": sum(p.comments or 0 for p in videos),
                 "shares": sum(p.shares or 0 for p in videos), "views": sum(p.views or 0 for p in videos),
                 "credits_spent_on_boosts": sum(p.credits or 0 for p in promos),
                 "gift_coins_received": sum(g.coins for g in gifts),
-                "creator_earnings": sum(g.withdrawable_coins or 0 for g in gifts)}
+                "creator_earnings": available_earnings,
+                "gross_creator_earnings": gross_earnings,
+                "reserved_withdrawal_coins": reserved,
+                "withdrawable_balance_naira": int(available_earnings * CREATOR_COIN_NAIRA)}
     finally:
         db.close()
 
@@ -1506,77 +1459,27 @@ def rewards(authorization: str | None = Header(default=None)):
         db.close()
 
 @app.post("/coins/transfer")
-def transfer_coins(
-    recipient_username: str = Form(...),
-    coins: int = Form(...),
-    note: str = Form(""),
-    authorization: str | None = Header(default=None)
-):
-    user = current_user(authorization)
-    coins = int(coins)
-
-    if coins <= 0:
-        raise HTTPException(400, "Enter more than 0 coins.")
-
+def transfer_coins(recipient_username: str = Form(...), coins: int = Form(...), note: str = Form(""),
+                  authorization: str | None = Header(default=None)):
+    user = current_user(authorization); coins = int(coins)
+    if coins <= 0: raise HTTPException(400, "Enter more than 0 coins.")
     db = SessionLocal()
     try:
-        recipient = db.query(User).filter(
-            User.username == _uname(recipient_username)
-        ).first()
-
-        if not recipient:
-            raise HTTPException(404, "That username was not found.")
-
-        if recipient.id == user.id:
-            raise HTTPException(400, "You cannot send coins to yourself.")
-
+        recipient = db.query(User).filter(User.username == _uname(recipient_username)).first()
+        if not recipient: raise HTTPException(404, "That username was not found.")
+        if recipient.id == user.id: raise HTTPException(400, "You cannot send coins to yourself.")
         sender = db.query(User).filter(User.id == user.id).first()
-
         ref, paid = _spend_coins(sender, coins)
-
-        if is_owner(sender):
-            paid = coins
-
-        # Add the received coins to the recipient's normal balance
+        if is_owner(sender): paid = coins
         recipient.referral_coins = (recipient.referral_coins or 0) + ref
         recipient.credits = (recipient.credits or 0) + paid
-
-        # Make transferred coins withdrawable creator earnings
-        db.add(
-            CreatorGift(
-                sender_id=sender.id,
-                recipient_id=recipient.id,
-                room_id=None,
-                coins=coins,
-                withdrawable_coins=paid,
-                gift_name="Coin Transfer"
-            )
-        )
-
-        # Keep a record of the transfer
-        db.add(
-            CoinTransfer(
-                sender_id=sender.id,
-                recipient_id=recipient.id,
-                coins=coins,
-                note=note[:160]
-            )
-        )
-
-        _notify(
-            db,
-            recipient.id,
-            f"{sender.username} sent you {coins} coins"
-        )
-
-        db.commit()
-
-        return {
-            "success": True,
-            "credits": public_credits(sender),
-            "recipient": recipient.username
-        }
-
+        db.add(CreatorGift(
+            sender_id=sender.id, recipient_id=recipient.id, room_id=None,
+            coins=coins, withdrawable_coins=paid, gift_name="Coin Transfer"
+        ))
+        db.add(CoinTransfer(sender_id=sender.id, recipient_id=recipient.id, coins=coins, note=note[:160]))
+        _notify(db, recipient.id, f"{sender.username} sent you {coins} coins"); db.commit()
+        return {"success": True, "credits": public_credits(sender), "recipient": recipient.username}
     finally:
         db.close()
 
@@ -1620,29 +1523,59 @@ def withdrawals(authorization: str | None = Header(default=None)):
         rows = db.query(WithdrawalRequest).filter(WithdrawalRequest.user_id == user.id).order_by(WithdrawalRequest.id.desc()).limit(50).all()
         return {"success": True, "withdrawals": [
             {"id": r.id, "amount_naira": r.amount_naira, "fee_naira": r.fee_naira, "net_naira": r.net_naira,
-             "status": r.status, "created_at": r.created_at.isoformat()} for r in rows]}
+             "withdrawable_coins": r.withdrawable_coins or 0, "status": r.status,
+             "created_at": r.created_at.isoformat() if r.created_at else None,
+             "paid_at": r.paid_at.isoformat() if r.paid_at else None,
+             "owner_note": r.owner_note or ""} for r in rows]}
     finally:
         db.close()
 
 @app.post("/withdrawals")
 def request_withdrawal(amount_naira: int = Form(...), bank_name: str = Form(...), account_name: str = Form(...),
                        account_number: str = Form(...), authorization: str | None = Header(default=None)):
-    user = current_user(authorization); amount = int(amount_naira)
-    if amount < 5000: raise HTTPException(400, "Minimum withdrawal is ₦5,000.")
-    fee = round(amount * 0.15); net = amount - fee
+    user = current_user(authorization)
+    amount = int(amount_naira)
+    if amount < WITHDRAWAL_NAIRA:
+        raise HTTPException(400, "Minimum withdrawal is ₦5,000.")
+    if amount % 25 != 0:
+        raise HTTPException(400, "Withdrawal amount must be a multiple of ₦25 so it matches the 800-coin / ₦5,000 conversion.")
+    bank_name = bank_name.strip()[:120]
+    account_name = account_name.strip()[:120]
+    account_number = account_number.strip()[:40]
+    if not bank_name or not account_name or not account_number:
+        raise HTTPException(400, "Bank name, account name and account number are required.")
+
+    coins_required = int(math.ceil(amount * WITHDRAWAL_COINS / WITHDRAWAL_NAIRA))
+    fee = round(amount * 0.15)
+    net = amount - fee
     db = SessionLocal()
     try:
-        already = db.query(WithdrawalRequest).filter(WithdrawalRequest.user_id == user.id,
-                    WithdrawalRequest.status.in_(["pending", "approved", "paid"])).all()
-        withdrawn = sum(x.amount_naira for x in already)
-        wcoins = sum((g.withdrawable_coins or 0) for g in db.query(CreatorGift).filter(CreatorGift.recipient_id == user.id).all())
-        eligible = wcoins * CREATOR_COIN_NAIRA - withdrawn
-        if amount > eligible:
-            raise HTTPException(400, f"Not enough withdrawable earnings. Available: ₦{max(0, eligible):,}")
-        row = WithdrawalRequest(user_id=user.id, amount_naira=amount, fee_naira=fee, net_naira=net, status="pending",
-                                bank_name=bank_name[:120], account_name=account_name[:120], account_number=account_number[:40])
-        db.add(row); db.commit(); db.refresh(row)
-        return {"success": True, "id": row.id, "amount_naira": amount, "fee_naira": fee, "net_naira": net, "status": "pending"}
+        gifts = db.query(CreatorGift).filter(CreatorGift.recipient_id == user.id).all()
+        gross_coins = sum(g.withdrawable_coins or 0 for g in gifts)
+        reserved = sum(
+            r.withdrawable_coins or 0
+            for r in db.query(WithdrawalRequest).filter(
+                WithdrawalRequest.user_id == user.id,
+                WithdrawalRequest.status.in_(["pending", "approved", "paid"])
+            ).all()
+        )
+        available_coins = max(0, gross_coins - reserved)
+        if coins_required > available_coins:
+            available_naira = int(available_coins * CREATOR_COIN_NAIRA)
+            raise HTTPException(400, f"Not enough withdrawable earnings. Available: ₦{available_naira:,} ({available_coins:,} coins).")
+
+        row = WithdrawalRequest(
+            user_id=user.id, amount_naira=amount, fee_naira=fee, net_naira=net, status="pending",
+            bank_name=bank_name, account_name=account_name, account_number=account_number,
+            withdrawable_coins=coins_required
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {
+            "success": True, "id": row.id, "amount_naira": amount, "fee_naira": fee,
+            "net_naira": net, "withdrawable_coins": coins_required, "status": "pending"
+        }
     finally:
         db.close()
 
