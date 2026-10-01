@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Requ
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -335,10 +336,30 @@ class UserActivity(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 def _ensure_col(table, column, definition):
+    """Add a missing legacy column without assuming SQLite.
+
+    The original app used PRAGMA table_info(), which is SQLite-specific.
+    Railway may use SQLite or PostgreSQL, so use SQLAlchemy's inspector instead.
+    """
+    from sqlalchemy import inspect
+
+    inspector = inspect(engine)
+    if table not in inspector.get_table_names():
+        return
+
+    columns = {col["name"] for col in inspector.get_columns(table)}
+    if column in columns:
+        return
+
+    # PostgreSQL uses TIMESTAMP rather than SQLite's DATETIME spelling.
+    ddl_definition = definition
+    if engine.dialect.name == "postgresql":
+        ddl_definition = ddl_definition.replace("DATETIME", "TIMESTAMP")
+
     with engine.begin() as conn:
-        cols = [r[1] for r in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
-        if column not in cols:
-            conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        conn.exec_driver_sql(
+            f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl_definition}'
+        )
 
 Base.metadata.create_all(bind=engine)
 _ensure_col("posts", "views", "INTEGER DEFAULT 0")
@@ -552,50 +573,119 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "owner_configured": bool(OWNER_EMAIL or OWNER_USERNAME)}
+    return {
+        "status": "healthy",
+        "owner_configured": bool(OWNER_EMAIL or OWNER_USERNAME),
+        "database": engine.dialect.name,
+        "uploads": str(UPLOAD_DIR),
+    }
 
 @app.post("/auth/register")
 def register(username: str = Form(...), email: str = Form(...), password: str = Form(...), referral_code: str = Form("")):
-    username = _uname(username); email = email.strip().lower()
+    username = _uname(username)
+    email = email.strip().lower()
+
     if len(username) < 3 or len(username) > 30:
         raise HTTPException(400, "Username must be 3–30 characters.")
     if len(password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters.")
+
     db = SessionLocal()
     try:
-        if db.query(User).filter((User.username == username) | (User.email == email)).first():
+        existing = db.query(User).filter(
+            (User.username == username) | (User.email == email)
+        ).first()
+        if existing:
             raise HTTPException(400, "That username or email is already in use.")
+
         referrer = None
         code = referral_code.strip().upper()
         if code:
             referrer = db.query(User).filter(User.referral_code == code).first()
             if not referrer:
                 raise HTTPException(400, "That referral code is not valid.")
-        user = User(username=username, email=email, password_hash=hash_password(password),
-                    credits=100, referral_code=("MSC" + secrets.token_hex(5)).upper(),
-                    referred_by_user_id=referrer.id if referrer else None)
-        db.add(user); db.commit(); db.refresh(user)
+
+        user = User(
+            username=username,
+            email=email,
+            password_hash=hash_password(password),
+            credits=100,
+            referral_code=("MSC" + secrets.token_hex(5)).upper(),
+            referred_by_user_id=referrer.id if referrer else None,
+        )
+        db.add(user)
+        db.flush()
+
         token = secrets.token_urlsafe(48)
-        db.add(SessionToken(user_id=user.id, token=token, expires_at=datetime.utcnow() + timedelta(days=30)))
+        db.add(
+            SessionToken(
+                user_id=user.id,
+                token=token,
+                expires_at=datetime.utcnow() + timedelta(days=30),
+            )
+        )
+
         if referrer and referrer.id != user.id:
             referrer.referral_coins = (referrer.referral_coins or 0) + 2
-            db.add(Notification(user_id=referrer.id, text=f"Referral reward: +2 coins for {user.username}"))
-            db.add(ReferralReward(referrer_id=referrer.id, referred_user_id=user.id, coins=2))
+            db.add(
+                Notification(
+                    user_id=referrer.id,
+                    text=f"Referral reward: +2 coins for {user.username}",
+                )
+            )
+            db.add(
+                ReferralReward(
+                    referrer_id=referrer.id,
+                    referred_user_id=user.id,
+                    coins=2,
+                )
+            )
+
         db.commit()
-        return {"success": True, "token": token, "user": user_json(user), "referral_code": user.referral_code}
+        db.refresh(user)
+        return {
+            "success": True,
+            "token": token,
+            "user": user_json(user),
+            "referral_code": user.referral_code,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "That username or email is already in use.")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Registration failed: {type(e).__name__}")
     finally:
         db.close()
 
 @app.post("/auth/login")
 def login(email: str = Form(...), password: str = Form(...)):
+    email = email.strip().lower()
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == email.strip().lower()).first()
+        user = db.query(User).filter(User.email == email).first()
         if not user or not verify_password(password, user.password_hash):
             raise HTTPException(401, "Incorrect email or password.")
+
         token = secrets.token_urlsafe(48)
-        db.add(SessionToken(user_id=user.id, token=token, expires_at=datetime.utcnow() + timedelta(days=30))); db.commit()
+        db.add(
+            SessionToken(
+                user_id=user.id,
+                token=token,
+                expires_at=datetime.utcnow() + timedelta(days=30),
+            )
+        )
+        db.commit()
         return {"success": True, "token": token, "user": user_json(user)}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Login failed: {type(e).__name__}")
     finally:
         db.close()
 
