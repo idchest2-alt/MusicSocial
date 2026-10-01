@@ -1029,33 +1029,76 @@ def _fulfill_payment(db, tx: PaymentTransaction, paystack_data: dict):
 
 @app.get("/payments/paystack/verify/{reference}")
 def verify_paystack(reference: str, authorization: str | None = Header(default=None)):
-    user = current_user(authorization)
+    auth_user = current_user(authorization)
+
     db = SessionLocal()
     try:
-        tx = db.query(PaymentTransaction).filter(PaymentTransaction.reference == reference, PaymentTransaction.user_id == user.id).first()
-        if not tx: raise HTTPException(404, "Payment not found.")
+        tx = db.query(PaymentTransaction).filter(
+            PaymentTransaction.reference == reference,
+            PaymentTransaction.user_id == auth_user.id
+        ).first()
+
+        if not tx:
+            raise HTTPException(404, "Payment not found.")
+
         try:
-            response = httpx.get(f"{PAYSTACK_BASE_URL}/transaction/verify/{reference}", headers=_paystack_headers(), timeout=30.0)
+            response = httpx.get(
+                f"{PAYSTACK_BASE_URL}/transaction/verify/{reference}",
+                headers=_paystack_headers(),
+                timeout=30.0
+            )
             data = response.json()
         except Exception as exc:
             raise HTTPException(502, f"Could not verify payment: {exc}")
+
         pay = data.get("data") or {}
+
         if response.status_code >= 400 or not data.get("status"):
-            raise HTTPException(400, data.get("message", "Payment verification failed."))
+            raise HTTPException(
+                400,
+                data.get("message", "Payment verification failed.")
+            )
+
         if pay.get("status") != "success":
-            tx.status = pay.get("status", "pending"); db.commit()
-            return {"success": True, "paid": False, "status": tx.status}
-        if int(pay.get("amount") or 0) != tx.amount_naira * 100 or pay.get("currency") != "NGN":
-            raise HTTPException(400, "Payment amount does not match this package.")
-       added = _fulfill_payment(db, tx, pay)
-db.commit()
+            tx.status = pay.get("status", "pending")
+            db.commit()
 
-fresh_user = db.query(User).filter(User.id == tx.user_id).first()
+            return {
+                "success": True,
+                "paid": False,
+                "status": tx.status
+            }
 
-return {"success": True, "paid": True, "already_fulfilled": not added,
-        "credits_added": tx.credits if added else 0,
-        "credits": public_credits(fresh_user),
-        "reference": reference}
+        if int(pay.get("amount") or 0) != tx.amount_naira * 100:
+            raise HTTPException(
+                400,
+                "Payment amount does not match this package."
+            )
+
+        if pay.get("currency") != "NGN":
+            raise HTTPException(
+                400,
+                "Payment currency does not match this package."
+            )
+
+        added = _fulfill_payment(db, tx, pay)
+        db.commit()
+
+        fresh_user = db.query(User).filter(
+            User.id == tx.user_id
+        ).first()
+
+        credits = public_credits(fresh_user)
+
+        return {
+            "success": True,
+            "paid": True,
+            "already_fulfilled": not added,
+            "credits_added": tx.credits if added else 0,
+            "credits": credits,
+            "reference": reference
+        }
+
     finally:
         db.close()
 
