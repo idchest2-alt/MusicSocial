@@ -69,6 +69,7 @@ class User(Base):
     referral_code = Column(String, unique=True, nullable=True, index=True)
     referred_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     referral_coins = Column(Integer, default=0)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class SessionToken(Base):
@@ -414,11 +415,18 @@ def current_user(authorization: str | None) -> User:
 def public_credits(user: User) -> int:
     return OWNER_PROMO if is_owner(user) else (user.credits or 0) + (user.referral_coins or 0)
 
+def user_is_online(user: User) -> bool:
+    seen = getattr(user, "last_seen_at", None)
+    return bool(seen and (datetime.utcnow() - seen).total_seconds() < 90)
+
 def user_json(user: User):
     return {
         "id": user.id, "username": user.username, "email": user.email,
         "bio": user.bio or "", "avatar_url": user.avatar_url or "",
-        "credits": public_credits(user), "is_owner": is_owner(user), "is_verified": bool(getattr(user, "is_verified", 0)),
+        "credits": public_credits(user), "is_owner": is_owner(user),
+        "is_verified": bool(getattr(user, "is_verified", 0)),
+        "online": user_is_online(user),
+        "last_seen_at": user.last_seen_at.isoformat() if getattr(user, "last_seen_at", None) else None,
     }
 
 def post_json(post: Post, liked=False, following=False, hashtags=None):
@@ -657,6 +665,8 @@ def user_suggestions(authorization: str | None = Header(default=None)):
             out.append({
                 "id": u.id, "username": u.username, "email": u.email, "bio": u.bio or "",
                 "avatar_url": u.avatar_url or "",
+                "online": user_is_online(u),
+                "last_seen_at": u.last_seen_at.isoformat() if u.last_seen_at else None,
                 "followers": db.query(Follow).filter(Follow.following_id == u.id).count(),
                 "following": db.query(Follow).filter(Follow.follower_id == me.id, Follow.following_id == u.id).first() is not None,
             })
@@ -674,6 +684,8 @@ def profile(username: str):
             raise HTTPException(404, "Creator not found.")
         return {
             "success": True, "user": user_json(user),
+            "online": user_is_online(user),
+            "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
             "followers": db.query(Follow).filter(Follow.following_id == user.id).count(),
             "following": db.query(Follow).filter(Follow.follower_id == user.id).count(),
             "posts": [post_json(p) for p in db.query(Post).filter(Post.user_id == user.id).order_by(Post.id.desc()).all()],
@@ -753,6 +765,51 @@ async def create_post(caption: str = Form(""), music_name: str = Form("Original 
         db.rollback(); raise HTTPException(500, f"Upload failed: {e}")
     finally:
         await video.close(); db.close()
+
+@app.delete("/posts/{post_id}")
+def delete_post(post_id: int, authorization: str | None = Header(default=None)):
+    """Delete a post owned by the signed-in user and remove its stored video file."""
+    user = current_user(authorization)
+    db = SessionLocal()
+    try:
+        post = db.query(Post).filter(Post.id == post_id).first()
+        if not post:
+            raise HTTPException(404, "Video not found.")
+        if post.user_id != user.id:
+            raise HTTPException(403, "You can only delete your own posts.")
+
+        video_url = post.video_url or ""
+
+        # Remove dependent records first because some existing tables use
+        # foreign keys without database-level ON DELETE CASCADE.
+        db.query(Comment).filter(Comment.post_id == post_id).delete(synchronize_session=False)
+        db.query(Like).filter(Like.post_id == post_id).delete(synchronize_session=False)
+        db.query(ViewEvent).filter(ViewEvent.post_id == post_id).delete(synchronize_session=False)
+        db.query(Promotion).filter(Promotion.post_id == post_id).delete(synchronize_session=False)
+        db.query(PostHashtag).filter(PostHashtag.post_id == post_id).delete(synchronize_session=False)
+        db.query(UserActivity).filter(UserActivity.post_id == post_id).delete(synchronize_session=False)
+        db.delete(post)
+        db.commit()
+
+        if video_url.startswith("/uploads/"):
+            file_path = UPLOAD_DIR / Path(video_url).name
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception:
+                # The database deletion already succeeded. A missing file should
+                # not turn a successful post deletion into a 500 response.
+                pass
+
+        return {"success": True, "deleted_post_id": post_id}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Unable to delete post: {e}")
+    finally:
+        db.close()
 
 @app.post("/posts/{post_id}/view")
 def record_view(post_id: int, authorization: str | None = Header(default=None)):
@@ -1268,9 +1325,27 @@ def update_online(user_id: int, authorization: str | None = Header(default=None)
     if me.id != user_id: raise HTTPException(403, "Not allowed.")
     db = SessionLocal()
     try:
-        row = db.query(User).filter(User.id == me.id).first(); row.last_seen_at = datetime.utcnow(); db.commit()
-        return {"success": True, "last_seen_at": row.last_seen_at.isoformat()}
-    finally: db.close()
+        row = db.query(User).filter(User.id == me.id).first()
+        if not row: raise HTTPException(404, "User not found.")
+        row.last_seen_at = datetime.utcnow()
+        db.commit()
+        return {"success": True, "online": True, "last_seen_at": row.last_seen_at.isoformat()}
+    finally:
+        db.close()
+
+@app.post("/users/{user_id}/offline")
+def update_offline(user_id: int, authorization: str | None = Header(default=None)):
+    me = current_user(authorization)
+    if me.id != user_id: raise HTTPException(403, "Not allowed.")
+    db = SessionLocal()
+    try:
+        row = db.query(User).filter(User.id == me.id).first()
+        if not row: raise HTTPException(404, "User not found.")
+        row.last_seen_at = datetime.utcnow() - timedelta(seconds=120)
+        db.commit()
+        return {"success": True, "online": False, "last_seen_at": row.last_seen_at.isoformat()}
+    finally:
+        db.close()
 
 @app.get("/users/{user_id}/presence")
 def user_presence(user_id: int, authorization: str | None = Header(default=None)):
@@ -1278,9 +1353,10 @@ def user_presence(user_id: int, authorization: str | None = Header(default=None)
     try:
         row = db.query(User).filter(User.id == user_id).first()
         if not row: raise HTTPException(404, "User not found.")
-        online = bool(row.last_seen_at and (datetime.utcnow() - row.last_seen_at).total_seconds() < 90)
+        online = user_is_online(row)
         return {"success": True, "online": online, "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None}
-    finally: db.close()
+    finally:
+        db.close()
 
 @app.get("/admin/dashboard")
 def admin_dashboard(authorization: str | None = Header(default=None)):
@@ -1318,6 +1394,7 @@ def admin_dashboard(authorization: str | None = Header(default=None)):
             "referral_rewards": db.query(ReferralReward).count(),
             "gift_coins_sent": sum(g.coins for g in db.query(CreatorGift).all()),
             "withdrawal_requests": db.query(WithdrawalRequest).count(),
+            "withdrawals": withdrawal_rows,
             "pending_withdrawals": withdrawal_rows,
         }
     finally:
@@ -1343,7 +1420,7 @@ def admin_pay_withdrawal(withdrawal_id: int, note: str = Form(""), authorization
         if recipient:
             _notify(db, recipient.id, f"Your withdrawal of ₦{row.net_naira:,} has been paid. ₦{row.fee_naira:,} withdrawal fee was applied.")
         db.commit()
-        return {"success": True, "id": row.id, "status": row.status, "withdrawable_coins_deducted": row.withdrawable_coins or 0}
+        return {"success": True, "status": "success", "transaction": "withdrawal_paid", "id": row.id, "withdrawal_status": row.status, "withdrawable_coins_deducted": row.withdrawable_coins or 0}
     finally:
         db.close()
 
@@ -1363,7 +1440,7 @@ def admin_reject_withdrawal(withdrawal_id: int, note: str = Form(""), authorizat
         if recipient:
             _notify(db, recipient.id, f"Your withdrawal request for ₦{row.amount_naira:,} was rejected. Your withdrawable coins were not deducted.")
         db.commit()
-        return {"success": True, "id": row.id, "status": row.status}
+        return {"success": True, "status": "success", "transaction": "withdrawal_rejected", "id": row.id, "withdrawal_status": row.status}
     finally:
         db.close()
 
@@ -1393,7 +1470,8 @@ def promote_post(post_id: int = Form(...), credits: int = Form(BOOST_COST), auth
         _spend_coins(row, BOOST_COST)
         post.boost_score = (post.boost_score or 0) + BOOST_COST
         db.add(Promotion(user_id=user.id, post_id=post_id, credits=BOOST_COST)); _notify(db, user.id, f"Your video boost is active. {BOOST_COST} coins were used."); db.commit()
-        return {"success": True, "message": f"Boost on! {BOOST_COST} coins used. This video will show higher.",
+        return {"success": True, "status": "success", "transaction": "video_boost",
+                "message": f"Boost on! {BOOST_COST} coins used. This video will show higher.",
                 "credits": public_credits(row), "boost_score": post.boost_score}
     finally:
         db.close()
@@ -1483,7 +1561,7 @@ def transfer_coins(recipient_username: str = Form(...), coins: int = Form(...), 
         ))
         db.add(CoinTransfer(sender_id=sender.id, recipient_id=recipient.id, coins=coins, note=note[:160]))
         _notify(db, recipient.id, f"{sender.username} sent you {coins} coins"); db.commit()
-        return {"success": True, "credits": public_credits(sender), "recipient": recipient.username}
+        return {"success": True, "status": "success", "transaction": "coin_transfer", "credits": public_credits(sender), "recipient": recipient.username, "coins": coins}
     finally:
         db.close()
 
@@ -1515,7 +1593,7 @@ def send_gift(recipient_username: str = Form(""), coins: int = Form(...), gift_n
                                text=f"sent {gift_name} ({coins} coins)"))
             _notify(db, recipient.id, f"LIVE gift: {sender.username} sent {gift_name} worth {coins} coins")
         db.commit()
-        return {"success": True, "credits": public_credits(sender)}
+        return {"success": True, "status": "success", "transaction": "gift", "credits": public_credits(sender), "recipient": recipient.username, "coins": coins}
     finally:
         db.close()
 
@@ -1577,8 +1655,9 @@ def request_withdrawal(amount_naira: int = Form(...), bank_name: str = Form(...)
         db.commit()
         db.refresh(row)
         return {
-            "success": True, "id": row.id, "amount_naira": amount, "fee_naira": fee,
-            "net_naira": net, "withdrawable_coins": coins_required, "status": "pending"
+            "success": True, "status": "success", "transaction": "withdrawal_request",
+            "id": row.id, "amount_naira": amount, "fee_naira": fee,
+            "net_naira": net, "withdrawable_coins": coins_required
         }
     finally:
         db.close()
