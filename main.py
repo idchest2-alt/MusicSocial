@@ -65,6 +65,7 @@ PAYSTACK_PUBLIC_KEY = os.getenv(
 PAYSTACK_BASE_URL = "https://api.paystack.co"
 
 OWNER_EMAIL = os.getenv("MUSICSOCIAL_OWNER_EMAIL", "").strip().lower()
+OWNER_USERNAME = os.getenv("MUSICSOCIAL_OWNER_USERNAME", "@idchest").strip().lstrip("@").lower()
 
 
 
@@ -99,8 +100,13 @@ CREDIT_PACKAGES = {
 
 
 def is_owner(user) -> bool:
-
-          return bool(OWNER_EMAIL and user.email.lower() == OWNER_EMAIL)
+          # Allow the configured owner email OR the configured unique owner username.
+          # Set MUSICSOCIAL_OWNER_EMAIL in Railway for the strongest explicit match.
+          username = (getattr(user, "username", "") or "").strip().lstrip("@").lower()
+          email = (getattr(user, "email", "") or "").strip().lower()
+          username_match = bool(OWNER_USERNAME and username == OWNER_USERNAME)
+          email_match = bool(OWNER_EMAIL and email == OWNER_EMAIL)
+          return username_match or email_match
 
 
 
@@ -1640,7 +1646,7 @@ def _fulfill_payment(db, transaction: PaymentTransaction, paystack_data: dict):
 
                     user_id=user.id,
 
-                    text=f"Payment successful. {transaction.credits} boost credits were added to your wallet."
+                    text=f"Deposit successful! {transaction.credits} coins have been added to your MusicSocial wallet."
 
           ))
 
@@ -1936,6 +1942,8 @@ def admin_dashboard(authorization: str | None = Header(default=None)):
                               "owner": user_json(user),
 
                               "owner_promotional_credits": "UNLIMITED",
+
+                              "owner_wallet_credits": (user.credits or 0) + (user.referral_coins or 0),
 
                               "revenue_naira": sum(t.amount_naira for t in paid),
 
@@ -2521,7 +2529,7 @@ def request_withdrawal(
 
                               user_id=user.id,
 
-                              text=f"Withdrawal request received: ₦{amount:,} gross, ₦{fee:,} fee, ₦{net:,} net. Status: PENDING."
+                              text=f"Withdrawal request successful! ₦{amount:,} gross, ₦{fee:,} fee, ₦{net:,} net. Status: PENDING."
 
                     ))
 
@@ -2585,7 +2593,7 @@ def mark_withdrawal_paid(withdrawal_id: int, authorization: str | None = Header(
 
                                         user_id=recipient.id,
 
-                                        text=f"Your withdrawal of ₦{row.amount_naira:,} was marked PAID. ₦{row.net_naira:,} was the net payout after the 15% fee."
+                                        text=f"Withdrawal successful! Your request for ₦{row.amount_naira:,} has been marked PAID. Net payout: ₦{row.net_naira:,} after the 15% fee."
 
                               ))
 
@@ -2651,7 +2659,7 @@ def reject_withdrawal(
 
                                         user_id=recipient.id,
 
-                                        text=f"Your withdrawal request for ₦{row.amount_naira:,} was rejected. Your reserved earnings are available again. Reason: {row.rejection_reason}"
+                                        text=f"Withdrawal request update: your request for ₦{row.amount_naira:,} was rejected. Your reserved earnings are now available again. Reason: {row.rejection_reason}"
 
                               ))
 
