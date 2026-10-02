@@ -1852,6 +1852,49 @@ async def paystack_webhook(
 
 
 
+@app.post("/admin/announcements")
+def broadcast_announcement(
+    title: str = Form(...),
+    message: str = Form(...),
+    authorization: str | None = Header(default=None),
+):
+    """Create a persistent in-app announcement notification for every user."""
+    owner = current_user(authorization)
+    if not is_owner(owner):
+        raise HTTPException(403, "Owner access required")
+
+    clean_title = (title or "").strip()[:120]
+    clean_message = (message or "").strip()[:2000]
+    if not clean_title:
+        raise HTTPException(400, "Announcement title is required")
+    if not clean_message:
+        raise HTTPException(400, "Announcement message is required")
+
+    db = SessionLocal()
+    try:
+        recipients = db.query(User.id).all()
+        created_at = datetime.utcnow()
+        for (user_id,) in recipients:
+            db.add(Notification(
+                user_id=user_id,
+                text=f"📢 {clean_title}\n\n{clean_message}",
+                is_read=0,
+                created_at=created_at,
+            ))
+        db.commit()
+        return {
+            "success": True,
+            "message": "Announcement sent to all users",
+            "sent_count": len(recipients),
+            "title": clean_title,
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 @app.get("/admin/dashboard")
 
 def admin_dashboard(authorization: str | None = Header(default=None)):
@@ -1874,7 +1917,7 @@ def admin_dashboard(authorization: str | None = Header(default=None)):
 
                     posts = db.query(Post).count()
 
-                    withdrawal_rows = db.query(WithdrawalRequest).order_by(WithdrawalRequest.id.desc()).limit(100).all()
+                    withdrawal_rows = db.query(WithdrawalRequest).order_by(WithdrawalRequest.id.desc()).all()
 
                     withdrawal_items = []
 
