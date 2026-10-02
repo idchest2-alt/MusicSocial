@@ -340,11 +340,17 @@ class UserActivity(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 def _ensure_col(table, column, definition):
+    # PostgreSQL uses TIMESTAMP rather than DATETIME.
+    if engine.dialect.name == "postgresql":
+        definition = definition.replace("DATETIME", "TIMESTAMP")
+
     with engine.begin() as conn:
         existing = {c["name"] for c in inspect(engine).get_columns(table)}
-        if column not in existing:
-            conn.exec_driver_sql(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
 
+        if column not in existing:
+            conn.exec_driver_sql(
+                f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}'
+            )
 Base.metadata.create_all(bind=engine)
 _ensure_col("posts", "views", "INTEGER DEFAULT 0")
 _ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
@@ -355,7 +361,7 @@ _ensure_col("sessions", "expires_at", "DATETIME")
 _ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
 _ensure_col("users", "last_seen_at", "DATETIME")
 _ensure_col("withdrawal_requests", "withdrawable_coins", "INTEGER DEFAULT 0")
-_ensure_col("withdrawal_requests", "paid_at", "DATETIME")
+_ensure_col("withdrawal_requests", "paid_at", "TIMESTAMP")
 _ensure_col("withdrawal_requests", "owner_note", "VARCHAR DEFAULT ''")
 
 # Backfill the coin amount for withdrawal requests created before the new manual-payout system.
@@ -393,19 +399,20 @@ def current_user(authorization: str | None) -> User:
     token = authorization[7:].strip()
     db = SessionLocal()
     try:
-        session = db.query(SessionToken).filter(SessionToken.token == token).first()
-        if not session:
-            raise HTTPException(401, "Your session is invalid. Please sign in again.")
-        if session.expires_at is not None and session.expires_at <= datetime.utcnow():
-            db.delete(session)
-            db.commit()
-            raise HTTPException(401, "Your session has expired. Please sign in again.")
-        user = db.query(User).filter(User.id == session.user_id).first()
-        if not user:
-            raise HTTPException(401, "Account not found.")
-        return user
-    finally:
-        db.close()
+    session = db.query(SessionToken).filter(SessionToken.token == token).first()
+
+    if not session:
+        raise HTTPException(401, "Your session is invalid. Please sign in again.")
+
+    user = db.query(User).filter(User.id == session.user_id).first()
+
+    if not user:
+        raise HTTPException(401, "Account not found.")
+
+    return user
+
+finally:
+    db.close()
 
 def public_credits(user: User) -> int:
     return OWNER_PROMO if is_owner(user) else (user.credits or 0) + (user.referral_coins or 0)
