@@ -861,6 +861,37 @@ def update_me(
 
 
 
+@app.get("/users/suggestions")
+def user_suggestions(
+    authorization: str | None = Header(default=None),
+    limit: int = 20,
+):
+    """Return accounts the signed-in user is not already following.
+
+    Keep this static route ABOVE /users/{username}; otherwise FastAPI may
+    treat the word "suggestions" as a username and return User not found.
+    """
+    me = current_user(authorization)
+    limit = max(1, min(limit, 50))
+    db = SessionLocal()
+    try:
+        followed_ids = {
+            row.following_id
+            for row in db.query(Follow).filter(Follow.follower_id == me.id).all()
+        }
+        followed_ids.add(me.id)
+        candidates = (
+            db.query(User)
+            .filter(~User.id.in_(followed_ids))
+            .order_by(User.created_at.desc(), User.id.desc())
+            .limit(limit)
+            .all()
+        )
+        return {"success": True, "users": [user_json(user) for user in candidates]}
+    finally:
+        db.close()
+
+
 @app.get("/users/{username}")
 
 def profile(username: str):
