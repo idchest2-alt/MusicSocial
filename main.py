@@ -33,6 +33,7 @@ PAYSTACK_PUBLIC_KEY = os.getenv(
 )
 PAYSTACK_BASE_URL = "https://api.paystack.co"
 OWNER_EMAIL = os.getenv("MUSICSOCIAL_OWNER_EMAIL", "").strip().lower()
+OWNER_USERNAME = os.getenv("MUSICSOCIAL_OWNER_USERNAME", "@idchest").strip().lower()
 
 # Price is in naira; Paystack receives amount in kobo.
 CREATOR_COIN_NAIRA = 6.25  # 800 withdrawable coins = ₦5,000
@@ -46,7 +47,17 @@ CREDIT_PACKAGES = {
 }
 
 def is_owner(user) -> bool:
-    return bool(OWNER_EMAIL and user.email.lower() == OWNER_EMAIL)
+    """Recognize the owner by configured username or configured email."""
+    if user is None:
+        return False
+    username = (getattr(user, "username", "") or "").strip().lower()
+    email = (getattr(user, "email", "") or "").strip().lower()
+    configured_username = OWNER_USERNAME
+    if configured_username and not configured_username.startswith("@"):
+        configured_username = "@" + configured_username
+    username_match = bool(configured_username and username == configured_username)
+    email_match = bool(OWNER_EMAIL and email == OWNER_EMAIL)
+    return username_match or email_match
 
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("MUSICSOCIAL_ALLOWED_ORIGINS", "*").split(",") if x.strip()]
 
@@ -405,6 +416,34 @@ def update_me(
         db.commit()
         db.refresh(row)
         return {"success": True, "user": user_json(row)}
+    finally:
+        db.close()
+
+
+@app.get("/users/suggestions")
+def user_suggestions(authorization: str | None = Header(default=None), limit: int = 20):
+    """Return suggested accounts, excluding the current user."""
+    me = current_user(authorization)
+    safe_limit = max(1, min(int(limit), 50))
+    db = SessionLocal()
+    try:
+        followed_ids = {
+            row.following_id
+            for row in db.query(Follow).filter(Follow.follower_id == me.id).all()
+        }
+        candidates = db.query(User).filter(User.id != me.id).order_by(User.id.desc()).limit(200).all()
+        candidates.sort(key=lambda candidate: (candidate.id in followed_ids, -candidate.id))
+        return {
+            "success": True,
+            "users": [
+                {
+                    **user_json(candidate),
+                    "followers": db.query(Follow).filter(Follow.following_id == candidate.id).count(),
+                    "following": candidate.id in followed_ids,
+                }
+                for candidate in candidates[:safe_limit]
+            ],
+        }
     finally:
         db.close()
 
@@ -885,6 +924,31 @@ async def paystack_webhook(
         _fulfill_payment(db, transaction, pay_data)
         db.commit()
         return {"received": True}
+    finally:
+        db.close()
+
+
+@app.post("/admin/announcements")
+def create_announcement(
+    title: str = Form(...),
+    message: str = Form(...),
+    authorization: str | None = Header(default=None),
+):
+    """Create an in-app announcement notification for every registered user."""
+    owner = current_user(authorization)
+    if not is_owner(owner):
+        raise HTTPException(403, "Owner access required")
+    clean_title = (title or "").strip()[:120]
+    clean_message = (message or "").strip()[:1000]
+    if not clean_title or not clean_message:
+        raise HTTPException(400, "Announcement title and message are required")
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        for recipient in users:
+            db.add(Notification(user_id=recipient.id, text=f"📢 {clean_title}: {clean_message}"))
+        db.commit()
+        return {"success": True, "sent": len(users), "title": clean_title}
     finally:
         db.close()
 
