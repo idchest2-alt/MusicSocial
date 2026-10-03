@@ -1128,7 +1128,7 @@ async def create_post(
 
                     db.refresh(post)
 
-                    tags = sorted({t.lower() for t in re.findall(r"(?\<!\w)#([A-Za-z0-9_]{1,40})", caption)})
+                    tags = sorted({t.lower() for t in re.findall(r"(?<!\w)#([A-Za-z0-9_]{1,40})", caption)})
 
                     for tag in tags:
 
@@ -2599,11 +2599,17 @@ def mark_withdrawal_paid(withdrawal_id: int, authorization: str | None = Header(
                               ))
 
                     try:
+
                               db.commit()
+
                               db.refresh(row)
+
                               return {"success": True, "status": row.status, "withdrawal": _withdrawal_json(row, recipient.username if recipient else "")}
+
                     except Exception:
+
                               db.rollback()
+
                               raise
 
           finally:
@@ -2668,11 +2674,17 @@ def reject_withdrawal(
                               ))
 
                     try:
+
                               db.commit()
+
                               db.refresh(row)
+
                               return {"success": True, "status": row.status, "withdrawal": _withdrawal_json(row, recipient.username if recipient else "")}
+
                     except Exception:
+
                               db.rollback()
+
                               raise
 
           finally:
