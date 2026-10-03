@@ -79,7 +79,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 UPLOAD_DIR = Path(os.getenv("MUSICSOCIAL_UPLOAD_DIR", str(BASE_DIR / "uploads")))
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
