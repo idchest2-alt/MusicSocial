@@ -238,10 +238,10 @@ class WithdrawalRequest(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
-_ensure_sqlite_column("posts", "views", "INTEGER DEFAULT 0")
-_ensure_sqlite_column("users", "referral_code", "VARCHAR")
-_ensure_sqlite_column("users", "referred_by_user_id", "INTEGER")
-_ensure_sqlite_column("users", "referral_coins", "INTEGER DEFAULT 0")
+_ensure_db_column("posts", "views", "INTEGER", "DEFAULT 0")
+_ensure_db_column("users", "referral_code", "VARCHAR")
+_ensure_db_column("users", "referred_by_user_id", "INTEGER")
+_ensure_db_column("users", "referral_coins", "INTEGER", "DEFAULT 0")
 # Automatic migration for existing withdrawal/transfer tables (SQLite or PostgreSQL).
 _ensure_db_column("coin_transfers", "withdrawable_coins", "INTEGER", "DEFAULT 0")
 _ensure_db_column("withdrawal_requests", "reserved_coins", "INTEGER", "DEFAULT 0")
