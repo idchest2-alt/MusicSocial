@@ -119,6 +119,8 @@ class Post(Base):
     shares = Column(Integer, default=0)
     views = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
+    idempotency_key = Column(String, nullable=True, index=True)
+    repost_of_id = Column(Integer, nullable=True, index=True)
 
 
 class Comment(Base):
@@ -250,6 +252,8 @@ class WithdrawalRequest(Base):
 
 Base.metadata.create_all(bind=engine)
 _ensure_db_column("posts", "views", "INTEGER", "DEFAULT 0")
+_ensure_db_column("posts", "idempotency_key", "VARCHAR")
+_ensure_db_column("posts", "repost_of_id", "INTEGER")
 _ensure_db_column("users", "referral_code", "VARCHAR")
 _ensure_db_column("users", "referred_by_user_id", "INTEGER")
 _ensure_db_column("users", "referral_coins", "INTEGER", "DEFAULT 0")
@@ -305,12 +309,20 @@ def user_json(user: User):
 
 
 def post_json(post: Post, liked=False, following=False, hashtags=None):
+    original = None
+    if post.repost_of_id:
+        original = {
+            "id": post.repost_of_id,
+        }
     return {
         "id": post.id, "user_id": post.user_id, "username": post.username,
         "caption": post.caption, "video_url": post.video_url,
         "music_name": post.music_name, "likes": post.likes or 0,
         "comments": post.comments or 0, "shares": post.shares or 0, "views": post.views or 0,
         "liked": liked, "following": following, "hashtags": hashtags or [],
+        "repost_of_id": post.repost_of_id,
+        "is_repost": bool(post.repost_of_id),
+        "original": original,
         "created_at": post.created_at.isoformat() if post.created_at else None,
     }
 
@@ -529,11 +541,21 @@ async def create_post(
     music_name: str = Form("Original Sound"),
     video: UploadFile = File(...),
     authorization: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     user = current_user(authorization)
     db = SessionLocal()
     file_path = None
     try:
+        clean_key = (idempotency_key or "").strip()[:120]
+        if clean_key:
+            existing = db.query(Post).filter(
+                Post.user_id == user.id,
+                Post.idempotency_key == clean_key,
+            ).first()
+            if existing:
+                return {"success": True, "already_created": True, "post": post_json(existing)}
+
         if not video.content_type or not video.content_type.startswith("video/"):
             raise HTTPException(400, f"Only video files are allowed. Received: {video.content_type}")
         extension = Path(video.filename or "video.mp4").suffix.lower() or ".mp4"
@@ -550,15 +572,20 @@ async def create_post(
                 if total > max_bytes:
                     raise HTTPException(413, "Video is too large (max 150 MB)")
                 buffer.write(chunk)
+        if total <= 0:
+            raise HTTPException(400, "The uploaded video is empty")
+
         post = Post(
             user_id=user.id,
             username=user.username,
-            caption=caption,
+            caption=caption[:5000],
             video_url=f"/uploads/{filename}",
-            music_name=music_name,
+            music_name=(music_name or "Original Sound")[:160],
             likes=0,
             comments=0,
             shares=0,
+            idempotency_key=clean_key or None,
+            repost_of_id=None,
         )
         db.add(post)
         db.commit()
@@ -567,7 +594,7 @@ async def create_post(
         for tag in tags:
             db.add(PostHashtag(post_id=post.id, hashtag=tag))
         db.commit()
-        return {"success": True, "post": post_json(post, hashtags=tags)}
+        return {"success": True, "already_created": False, "post": post_json(post, hashtags=tags)}
     except HTTPException:
         if file_path and file_path.exists():
             file_path.unlink()
@@ -579,6 +606,86 @@ async def create_post(
         raise HTTPException(500, f"Upload failed: {e}")
     finally:
         await video.close()
+        db.close()
+
+
+@app.delete("/posts/{post_id}")
+def delete_post(post_id: int, authorization: str | None = Header(default=None)):
+    user = current_user(authorization)
+    db = SessionLocal()
+    try:
+        post = db.query(Post).filter(Post.id == post_id).first()
+        if not post:
+            raise HTTPException(404, "Post not found")
+        if post.user_id != user.id:
+            raise HTTPException(403, "You can only delete your own videos")
+
+        video_url = post.video_url
+        db.query(Like).filter(Like.post_id == post.id).delete(synchronize_session=False)
+        db.query(Comment).filter(Comment.post_id == post.id).delete(synchronize_session=False)
+        db.query(ViewEvent).filter(ViewEvent.post_id == post.id).delete(synchronize_session=False)
+        db.query(PostHashtag).filter(PostHashtag.post_id == post.id).delete(synchronize_session=False)
+        db.query(Promotion).filter(Promotion.post_id == post.id).delete(synchronize_session=False)
+        db.delete(post)
+        db.commit()
+
+        # Reposts can safely keep using the shared video file. Delete the file only
+        # when no other post references it anymore.
+        still_used = db.query(Post).filter(Post.video_url == video_url).first()
+        if not still_used and video_url.startswith("/uploads/"):
+            candidate = UPLOAD_DIR / Path(video_url).name
+            if candidate.exists():
+                candidate.unlink()
+        return {"success": True, "deleted": True, "post_id": post_id}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Could not delete post: {e}")
+    finally:
+        db.close()
+
+
+@app.post("/posts/{post_id}/repost")
+def repost_post(post_id: int, authorization: str | None = Header(default=None)):
+    user = current_user(authorization)
+    db = SessionLocal()
+    try:
+        original = db.query(Post).filter(Post.id == post_id).first()
+        if not original:
+            raise HTTPException(404, "Post not found")
+        if original.user_id == user.id:
+            raise HTTPException(400, "You cannot repost your own video")
+
+        repost = Post(
+            user_id=user.id,
+            username=user.username,
+            caption=original.caption or "",
+            video_url=original.video_url,
+            music_name=original.music_name or "Original Sound",
+            likes=0,
+            comments=0,
+            shares=0,
+            repost_of_id=original.id,
+        )
+        db.add(repost)
+        original.shares = (original.shares or 0) + 1
+        if original.user_id:
+            db.add(Notification(
+                user_id=original.user_id,
+                text=f"{user.username} reposted your video",
+            ))
+        db.commit()
+        db.refresh(repost)
+        return {"success": True, "reposted": True, "post": post_json(repost)}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Could not repost video: {e}")
+    finally:
         db.close()
 
 
