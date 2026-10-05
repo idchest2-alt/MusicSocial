@@ -1538,6 +1538,7 @@ def music_hub():
         rows=db.query(MusicTrack).order_by(MusicTrack.uses.desc(),MusicTrack.id.desc()).limit(100).all()
         return {"success":True,"tracks":[{
             "id":r.id,
+            "owner_id":r.owner_id,
             "title":r.title,
             "artist":r.artist,
             "audio_url":r.audio_url,
@@ -1567,6 +1568,45 @@ async def upload_music_hub(title:str=Form(...), audio:UploadFile=File(...), auth
     except Exception:
         db.rollback(); path.unlink(missing_ok=True); raise
     finally: db.close()
+
+@app.delete("/music-hub/{track_id}")
+def delete_music_track(track_id:int, authorization:str|None=Header(default=None)):
+    """Delete a music track owned by the authenticated creator.
+
+    The database record is removed and the uploaded audio file is removed when
+    it is a local /uploads file. This does not delete videos that previously
+    used the sound because those videos have their own media files.
+    """
+    user = current_user(authorization)
+    db = SessionLocal()
+    try:
+        track = db.query(MusicTrack).filter(MusicTrack.id == track_id).first()
+        if not track:
+            raise HTTPException(404, "Song not found")
+        if track.owner_id != user.id:
+            raise HTTPException(403, "You can only delete music that you uploaded")
+
+        audio_url = track.audio_url or ""
+        db.delete(track)
+        db.commit()
+
+        if audio_url.startswith("/uploads/"):
+            filename = Path(audio_url).name
+            file_path = UPLOAD_DIR / filename
+            try:
+                file_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        return {"success": True, "deleted": True, "track_id": track_id}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Could not delete song: {e}")
+    finally:
+        db.close()
 
 @app.post("/music-hub/{track_id}/use")
 def use_music_track(track_id:int,authorization:str|None=Header(default=None)):
