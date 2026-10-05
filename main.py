@@ -777,15 +777,57 @@ def follow_user(user_id: int, authorization: str | None = Header(default=None)):
 @app.get("/posts")
 def get_posts(authorization: str | None = Header(default=None)):
     db = SessionLocal()
+
     try:
         me_id = None
+
         if authorization and authorization.startswith("Bearer "):
-            s = db.query(SessionToken).filter(SessionToken.token == authorization[7:].strip()).first()
-            if s: me_id = s.user_id
-        posts = db.query(Post).order_by(Post.boost_score.desc(), Post.id.desc()).all()
-        liked = {x.post_id for x in db.query(Like).filter(Like.user_id == me_id).all()} if me_id else set()
-        following = {x.following_id for x in db.query(Follow).filter(Follow.follower_id == me_id).all()} if me_id else set()
-        return {"success": True, "posts": [post_json(p, p.id in liked, p.user_id in following if p.user_id else False) for p in posts]}
+            s = db.query(SessionToken).filter(
+                SessionToken.token == authorization[7:].strip()
+            ).first()
+
+            if s:
+                me_id = s.user_id
+
+        posts = db.query(Post).order_by(
+            Post.boost_score.desc(),
+            Post.id.desc()
+        ).all()
+
+        liked = {
+            x.post_id
+            for x in db.query(Like).filter(Like.user_id == me_id).all()
+        } if me_id else set()
+
+        following = {
+            x.following_id
+            for x in db.query(Follow).filter(Follow.follower_id == me_id).all()
+        } if me_id else set()
+
+        valid_posts = []
+
+        for p in posts:
+            # Skip posts whose uploaded video file no longer exists
+            if p.video_url and p.video_url.startswith("/uploads/"):
+                filename = p.video_url.replace("/uploads/", "", 1)
+                video_path = UPLOAD_DIR / filename
+
+                if not video_path.is_file():
+                    continue
+
+            valid_posts.append(
+                post_json(
+                    p,
+                    p.id in liked,
+                    p.user_id in following if p.user_id else False
+                )
+            )
+
+        return {
+            "success": True,
+            "posts": valid_posts
+        }
+
     finally:
         db.close()
 
