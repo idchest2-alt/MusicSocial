@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Request
-from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Float, Text, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime
@@ -15,7 +15,6 @@ import os
 import json
 import hmac
 import math
-import html
 
 import httpx
 from dotenv import load_dotenv
@@ -310,10 +309,12 @@ def user_json(user: User):
     }
 
 
-def post_json(post: Post, liked=False, following=False, hashtags=None, reposted=False):
+def post_json(post: Post, liked=False, following=False, hashtags=None):
     original = None
     if post.repost_of_id:
-        original = {"id": post.repost_of_id}
+        original = {
+            "id": post.repost_of_id,
+        }
     return {
         "id": post.id, "user_id": post.user_id, "username": post.username,
         "caption": post.caption, "video_url": post.video_url,
@@ -322,8 +323,6 @@ def post_json(post: Post, liked=False, following=False, hashtags=None, reposted=
         "liked": liked, "following": following, "hashtags": hashtags or [],
         "repost_of_id": post.repost_of_id,
         "is_repost": bool(post.repost_of_id),
-        "reposted": bool(reposted),
-        "repost_count": 0,
         "original": original,
         "created_at": post.created_at.isoformat() if post.created_at else None,
     }
@@ -527,21 +526,11 @@ def get_posts(authorization: str | None = Header(default=None)):
                 me_id = session.user_id
         posts = db.query(Post).order_by(Post.id.desc()).all()
         liked_ids = set()
-        reposted_ids = set()
         if me_id:
             liked_ids = {
                 x.post_id for x in db.query(Like).filter(Like.user_id == me_id).all()
             }
-            reposted_ids = {
-                x.repost_of_id
-                for x in db.query(Post).filter(
-                    Post.user_id == me_id, Post.repost_of_id.isnot(None)
-                ).all()
-            }
-        return {
-            "success": True,
-            "posts": [post_json(p, p.id in liked_ids, reposted=p.id in reposted_ids) for p in posts]
-        }
+        return {"success": True, "posts": [post_json(p, p.id in liked_ids) for p in posts]}
     finally:
         db.close()
 
@@ -664,19 +653,19 @@ def repost_post(post_id: int, authorization: str | None = Header(default=None)):
     user = current_user(authorization)
     db = SessionLocal()
     try:
-        selected = db.query(Post).filter(Post.id == post_id).first()
-        if not selected:
+        requested = db.query(Post).filter(Post.id == post_id).first()
+        if not requested:
             raise HTTPException(404, "Post not found")
 
-        # Always repost the original post, even if the user tapped Repost on an existing repost.
-        root_id = selected.repost_of_id or selected.id
-        original = db.query(Post).filter(Post.id == root_id).first()
+        # Reposting a repost always points to the original post.
+        original_id = requested.repost_of_id or requested.id
+        original = db.query(Post).filter(Post.id == original_id).first()
         if not original:
             raise HTTPException(404, "Original post not found")
         if original.user_id == user.id:
             raise HTTPException(400, "You cannot repost your own video")
 
-        # One repost per user per original post.
+        # Prevent the same user from reposting the same original more than once.
         existing = db.query(Post).filter(
             Post.user_id == user.id,
             Post.repost_of_id == original.id,
@@ -684,7 +673,7 @@ def repost_post(post_id: int, authorization: str | None = Header(default=None)):
         if existing:
             return {
                 "success": True,
-                "reposted": True,
+                "reposted": False,
                 "already_reposted": True,
                 "post": post_json(existing),
             }
@@ -698,15 +687,17 @@ def repost_post(post_id: int, authorization: str | None = Header(default=None)):
             likes=0,
             comments=0,
             shares=0,
-            views=0,
             repost_of_id=original.id,
         )
         db.add(repost)
+
+        # IMPORTANT: reposts are not shares. Do not increment original.shares here.
         if original.user_id and original.user_id != user.id:
             db.add(Notification(
                 user_id=original.user_id,
                 text=f"{user.username} reposted your video",
             ))
+
         db.commit()
         db.refresh(repost)
         return {
@@ -831,9 +822,9 @@ def share_post(post_id: int, authorization: str | None = Header(default=None)):
         db.close()
 
 
-@app.get("/shared/posts/{post_id}", response_class=HTMLResponse)
-def shared_post(post_id: int, request: Request):
-    """Public page used by Android/social sharing. It contains the actual post/video URL."""
+@app.get("/shared/posts/{post_id}")
+def shared_post_page(post_id: int, request: Request):
+    """Public HTML page used by Android Share links and social apps."""
     db = SessionLocal()
     try:
         post = db.query(Post).filter(Post.id == post_id).first()
@@ -841,30 +832,36 @@ def shared_post(post_id: int, request: Request):
             raise HTTPException(404, "Post not found")
 
         base = str(request.base_url).rstrip("/")
-        video_url = post.video_url or ""
-        if video_url.startswith("/"):
-            video_url = base + video_url
-
+        video_url = post.video_url
+        if video_url.startswith("http://") or video_url.startswith("https://"):
+            public_video = video_url
+        else:
+            public_video = f"{base}{video_url if video_url.startswith('/') else '/' + video_url}"
         share_url = f"{base}/shared/posts/{post.id}"
-        title = html.escape(f"MusicSocial - {post.username}")
-        caption = html.escape(post.caption or "Check out this music video on MusicSocial.")
-        safe_video = html.escape(video_url, quote=True)
-        safe_share_url = html.escape(share_url, quote=True)
-
-        # This is a public, browser-friendly landing page. Android shares this
-        # URL so WhatsApp/X/Telegram/etc. have a real web address to preview.
-        return HTMLResponse(content=f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
-<link rel="canonical" href="{safe_share_url}">
-<meta property="og:type" content="video.other">
-<meta property="og:title" content="{title}">
+        username = post.username or "@creator"
+        caption = (post.caption or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+        safe_username = username.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+        safe_video = public_video.replace("&", "&amp;").replace('"', "&quot;")
+        safe_share_url = share_url.replace("&", "&amp;").replace('"', "&quot;")
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MusicSocial - {safe_username}</title>
+<meta name="description" content="Watch this video on MusicSocial by {safe_username}">
+<meta property="og:title" content="MusicSocial video by {safe_username}">
 <meta property="og:description" content="{caption}">
+<meta property="og:type" content="video.other">
 <meta property="og:url" content="{safe_share_url}">
 <meta property="og:video" content="{safe_video}">
 <meta property="og:video:type" content="video/mp4">
-<style>body{{font-family:Arial,sans-serif;background:#11142A;color:#fff;margin:0;padding:24px}}main{{max-width:720px;margin:auto}}video{{width:100%;border-radius:16px;background:#000}}a{{color:#A78BFA}}.btn{{display:inline-block;padding:12px 18px;background:#7C3AED;color:#fff;border-radius:10px;text-decoration:none}}</style>
-</head><body><main><h1>{title}</h1><p>{caption}</p><video controls playsinline preload="metadata" src="{safe_video}"></video><p><a class="btn" href="{safe_video}">Open video</a></p></main></body></html>""", media_type="text/html")
+<meta name="twitter:card" content="player">
+<style>body{{margin:0;background:#090b1a;color:#f8fafc;font-family:Arial,sans-serif;display:flex;justify-content:center}}main{{width:min(720px,100%);padding:24px;box-sizing:border-box}}video{{width:100%;max-height:75vh;background:#000;border-radius:18px}}a{{display:inline-block;margin-top:16px;padding:12px 18px;background:#7c3aed;color:#fff;text-decoration:none;border-radius:12px}}p{{color:#cbd5e1}}</style>
+</head>
+<body><main><h1>MusicSocial</h1><p><strong>{safe_username}</strong></p><p>{caption}</p><video controls playsinline preload="metadata"><source src="{safe_video}" type="video/mp4"></video><br><a href="{safe_share_url}">Open MusicSocial</a></main></body>
+</html>"""
+        return HTMLResponse(content=html)
     finally:
         db.close()
 
