@@ -1,7 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Float, Text, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime
@@ -82,6 +81,20 @@ Base = declarative_base()
 UPLOAD_DIR = Path(os.getenv("MUSICSOCIAL_UPLOAD_DIR", str(BASE_DIR / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+def upload_file_exists(url: str | None) -> bool:
+    """Return whether a local uploaded media file still exists.
+
+    Database rows can outlive a container filesystem after a deployment. The
+    API exposes this flag so Android can avoid repeatedly requesting missing
+    media and can show a clear 'unavailable' state instead.
+    """
+    if not url:
+        return False
+    if url.startswith("/uploads/"):
+        name = Path(url.split("?", 1)[0]).name
+        return (UPLOAD_DIR / name).is_file()
+    return True
 
 
 class User(Base):
@@ -325,6 +338,7 @@ def post_json(post: Post, liked=False, following=False, hashtags=None):
         "is_repost": bool(post.repost_of_id),
         "original": original,
         "created_at": post.created_at.isoformat() if post.created_at else None,
+        "video_available": upload_file_exists(post.video_url),
     }
 
 
@@ -657,26 +671,21 @@ def repost_post(post_id: int, authorization: str | None = Header(default=None)):
         if not requested:
             raise HTTPException(404, "Post not found")
 
-        # Reposting a repost always points to the original post.
-        original_id = requested.repost_of_id or requested.id
-        original = db.query(Post).filter(Post.id == original_id).first()
-        if not original:
-            raise HTTPException(404, "Original post not found")
+        # Reposting a repost should always point to the original post.
+        original = requested
+        if requested.repost_of_id:
+            original = db.query(Post).filter(Post.id == requested.repost_of_id).first() or requested
+
         if original.user_id == user.id:
             raise HTTPException(400, "You cannot repost your own video")
 
-        # Prevent the same user from reposting the same original more than once.
+        # Prevent duplicate reposts of the same original by the same user.
         existing = db.query(Post).filter(
             Post.user_id == user.id,
             Post.repost_of_id == original.id,
         ).first()
         if existing:
-            return {
-                "success": True,
-                "reposted": False,
-                "already_reposted": True,
-                "post": post_json(existing),
-            }
+            raise HTTPException(409, "You already reposted this video")
 
         repost = Post(
             user_id=user.id,
@@ -690,22 +699,14 @@ def repost_post(post_id: int, authorization: str | None = Header(default=None)):
             repost_of_id=original.id,
         )
         db.add(repost)
-
-        # IMPORTANT: reposts are not shares. Do not increment original.shares here.
         if original.user_id and original.user_id != user.id:
             db.add(Notification(
                 user_id=original.user_id,
                 text=f"{user.username} reposted your video",
             ))
-
         db.commit()
         db.refresh(repost)
-        return {
-            "success": True,
-            "reposted": True,
-            "already_reposted": False,
-            "post": post_json(repost),
-        }
+        return {"success": True, "reposted": True, "post": post_json(repost)}
     except HTTPException:
         db.rollback()
         raise
@@ -818,50 +819,6 @@ def share_post(post_id: int, authorization: str | None = Header(default=None)):
         post.shares = (post.shares or 0) + 1
         db.commit()
         return {"success": True, "shares": post.shares}
-    finally:
-        db.close()
-
-
-@app.get("/shared/posts/{post_id}")
-def shared_post_page(post_id: int, request: Request):
-    """Public HTML page used by Android Share links and social apps."""
-    db = SessionLocal()
-    try:
-        post = db.query(Post).filter(Post.id == post_id).first()
-        if not post:
-            raise HTTPException(404, "Post not found")
-
-        base = str(request.base_url).rstrip("/")
-        video_url = post.video_url
-        if video_url.startswith("http://") or video_url.startswith("https://"):
-            public_video = video_url
-        else:
-            public_video = f"{base}{video_url if video_url.startswith('/') else '/' + video_url}"
-        share_url = f"{base}/shared/posts/{post.id}"
-        username = post.username or "@creator"
-        caption = (post.caption or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-        safe_username = username.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-        safe_video = public_video.replace("&", "&amp;").replace('"', "&quot;")
-        safe_share_url = share_url.replace("&", "&amp;").replace('"', "&quot;")
-        html = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MusicSocial - {safe_username}</title>
-<meta name="description" content="Watch this video on MusicSocial by {safe_username}">
-<meta property="og:title" content="MusicSocial video by {safe_username}">
-<meta property="og:description" content="{caption}">
-<meta property="og:type" content="video.other">
-<meta property="og:url" content="{safe_share_url}">
-<meta property="og:video" content="{safe_video}">
-<meta property="og:video:type" content="video/mp4">
-<meta name="twitter:card" content="player">
-<style>body{{margin:0;background:#090b1a;color:#f8fafc;font-family:Arial,sans-serif;display:flex;justify-content:center}}main{{width:min(720px,100%);padding:24px;box-sizing:border-box}}video{{width:100%;max-height:75vh;background:#000;border-radius:18px}}a{{display:inline-block;margin-top:16px;padding:12px 18px;background:#7c3aed;color:#fff;text-decoration:none;border-radius:12px}}p{{color:#cbd5e1}}</style>
-</head>
-<body><main><h1>MusicSocial</h1><p><strong>{safe_username}</strong></p><p>{caption}</p><video controls playsinline preload="metadata"><source src="{safe_video}" type="video/mp4"></video><br><a href="{safe_share_url}">Open MusicSocial</a></main></body>
-</html>"""
-        return HTMLResponse(content=html)
     finally:
         db.close()
 
@@ -1579,7 +1536,16 @@ def music_hub():
     db=SessionLocal()
     try:
         rows=db.query(MusicTrack).order_by(MusicTrack.uses.desc(),MusicTrack.id.desc()).limit(100).all()
-        return {"success":True,"tracks":[{"id":r.id,"title":r.title,"artist":r.artist,"audio_url":r.audio_url,"cover_url":r.cover_url,"uses":r.uses or 0,"created_at":r.created_at.isoformat() if r.created_at else None} for r in rows]}
+        return {"success":True,"tracks":[{
+            "id":r.id,
+            "title":r.title,
+            "artist":r.artist,
+            "audio_url":r.audio_url,
+            "cover_url":r.cover_url,
+            "uses":r.uses or 0,
+            "created_at":r.created_at.isoformat() if r.created_at else None,
+            "audio_available": upload_file_exists(r.audio_url),
+        } for r in rows]}
     finally: db.close()
 
 @app.post("/music-hub/upload")
@@ -1597,7 +1563,7 @@ async def upload_music_hub(title:str=Form(...), audio:UploadFile=File(...), auth
             _spend_coins(row, 200)
         track=MusicTrack(owner_id=user.id,title=title.strip()[:120],artist=user.username,audio_url=f"/uploads/{name}",uses=0)
         db.add(track); db.commit(); db.refresh(track)
-        return {"success":True,"credits":999999999999 if is_owner(row) else (row.credits or 0) + (row.referral_coins or 0),"upload_cost":200,"track":{"id":track.id,"title":track.title,"artist":track.artist,"audio_url":track.audio_url,"uses":0}}
+        return {"success":True,"credits":999999999999 if is_owner(row) else (row.credits or 0) + (row.referral_coins or 0),"upload_cost":200,"track":{"id":track.id,"title":track.title,"artist":track.artist,"audio_url":track.audio_url,"uses":0,"audio_available":True}}
     except Exception:
         db.rollback(); path.unlink(missing_ok=True); raise
     finally: db.close()
