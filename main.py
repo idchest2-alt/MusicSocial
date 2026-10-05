@@ -790,40 +790,107 @@ def get_posts(authorization: str | None = Header(default=None)):
         db.close()
 
 @app.post("/posts")
-async def create_post(caption: str = Form(""), music_name: str = Form("Original Sound"),
-                      video: UploadFile = File(...), authorization: str | None = Header(default=None)):
+async def create_post(
+    caption: str = Form(""),
+    music_name: str = Form("Original Sound"),
+    video: UploadFile = File(...),
+    authorization: str | None = Header(default=None)
+):
     user = current_user(authorization)
-    db = SessionLocal(); path = None
+
+    db = SessionLocal()
+    path = None
+
     try:
         if not video.content_type or not video.content_type.startswith("video/"):
             raise HTTPException(400, "Please choose a video file.")
+
         ext = Path(video.filename or "video.mp4").suffix.lower() or ".mp4"
-        name = f"{uuid.uuid4().hex}{ext}"; path = UPLOAD_DIR / name
+        name = f"{uuid.uuid4().hex}{ext}"
+        path = UPLOAD_DIR / name
+
+        print("===== VIDEO UPLOAD DEBUG =====")
+        print("UPLOAD_DIR:", UPLOAD_DIR)
+        print("UPLOAD_DIR absolute:", UPLOAD_DIR.resolve())
+        print("Saving video to:", path)
+        print("Parent exists:", path.parent.exists())
+
         total = 0
+
         with open(path, "wb") as f:
             while True:
                 chunk = await video.read(1024 * 1024)
-                if not chunk: break
+
+                if not chunk:
+                    break
+
                 total += len(chunk)
+
                 if total > 150 * 1024 * 1024:
-                    raise HTTPException(413, "That video is too large (max 150 MB).")
+                    raise HTTPException(
+                        413,
+                        "That video is too large (max 150 MB)."
+                    )
+
                 f.write(chunk)
-        post = Post(user_id=user.id, username=user.username, caption=caption,
-                    video_url=f"/uploads/{name}", music_name=music_name)
-        db.add(post); db.commit(); db.refresh(post)
-        tags = sorted({t.lower() for t in re.findall(r"(?<!\w)#([A-Za-z0-9_]{1,40})", caption)})
-        for tag in tags:
-            db.add(PostHashtag(post_id=post.id, hashtag=tag))
+
+        print("Video saved successfully:", path.exists())
+        print("Video size:", path.stat().st_size if path.exists() else 0)
+        print("==============================")
+
+        post = Post(
+            user_id=user.id,
+            username=user.username,
+            caption=caption,
+            video_url=f"/uploads/{name}",
+            music_name=music_name
+        )
+
+        db.add(post)
         db.commit()
-        return {"success": True, "post": post_json(post, hashtags=tags)}
+        db.refresh(post)
+
+        tags = sorted({
+            t.lower()
+            for t in re.findall(
+                r"(?<!\w)#([A-Za-z0-9_]{1,40})",
+                caption
+            )
+        })
+
+        for tag in tags:
+            db.add(
+                PostHashtag(
+                    post_id=post.id,
+                    hashtag=tag
+                )
+            )
+
+        db.commit()
+
+        return {
+            "success": True,
+            "post": post_json(post, hashtags=tags)
+        }
+
     except HTTPException:
-        if path and path.exists(): path.unlink()
+        if path and path.exists():
+            path.unlink()
         raise
+
     except Exception as e:
-        if path and path.exists(): path.unlink()
-        db.rollback(); raise HTTPException(500, f"Upload failed: {e}")
+        if path and path.exists():
+            path.unlink()
+
+        db.rollback()
+        raise HTTPException(
+            500,
+            f"Upload failed: {e}"
+        )
+
     finally:
-        await video.close(); db.close()
+        await video.close()
+        db.close()
 
 @app.post("/posts/{post_id}/view")
 def record_view(post_id: int, authorization: str | None = Header(default=None)):
