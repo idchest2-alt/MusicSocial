@@ -844,17 +844,27 @@ def shared_post(post_id: int, request: Request):
         video_url = post.video_url or ""
         if video_url.startswith("/"):
             video_url = base + video_url
+
+        share_url = f"{base}/shared/posts/{post.id}"
         title = html.escape(f"MusicSocial - {post.username}")
         caption = html.escape(post.caption or "Check out this music video on MusicSocial.")
         safe_video = html.escape(video_url, quote=True)
-        return f"""<!doctype html>
+        safe_share_url = html.escape(share_url, quote=True)
+
+        # This is a public, browser-friendly landing page. Android shares this
+        # URL so WhatsApp/X/Telegram/etc. have a real web address to preview.
+        return HTMLResponse(content=f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
+<link rel="canonical" href="{safe_share_url}">
+<meta property="og:type" content="video.other">
 <meta property="og:title" content="{title}">
 <meta property="og:description" content="{caption}">
+<meta property="og:url" content="{safe_share_url}">
 <meta property="og:video" content="{safe_video}">
-<style>body{{font-family:Arial,sans-serif;background:#11142A;color:#fff;margin:0;padding:24px}}main{{max-width:720px;margin:auto}}video{{width:100%;border-radius:16px;background:#000}}a{{color:#A78BFA}}</style>
-</head><body><main><h1>{title}</h1><p>{caption}</p><video controls playsinline src="{safe_video}"></video><p><a href="{safe_video}">Open video</a></p></main></body></html>"""
+<meta property="og:video:type" content="video/mp4">
+<style>body{{font-family:Arial,sans-serif;background:#11142A;color:#fff;margin:0;padding:24px}}main{{max-width:720px;margin:auto}}video{{width:100%;border-radius:16px;background:#000}}a{{color:#A78BFA}}.btn{{display:inline-block;padding:12px 18px;background:#7C3AED;color:#fff;border-radius:10px;text-decoration:none}}</style>
+</head><body><main><h1>{title}</h1><p>{caption}</p><video controls playsinline preload="metadata" src="{safe_video}"></video><p><a class="btn" href="{safe_video}">Open video</a></p></main></body></html>""", media_type="text/html")
     finally:
         db.close()
 
