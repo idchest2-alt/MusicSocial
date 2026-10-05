@@ -1655,15 +1655,42 @@ def request_withdrawal(amount_naira: int = Form(...), bank_name: str = Form(...)
 @app.get("/music-hub")
 def music_hub():
     db = SessionLocal()
+
     try:
-        rows = db.query(MusicTrack).order_by(MusicTrack.uses.desc(), MusicTrack.id.desc()).limit(100).all()
-        return {"success": True, "tracks": [
-            {"id": r.id, "title": r.title, "artist": r.artist, "audio_url": r.audio_url,
-             "cover_url": r.cover_url, "uses": r.uses or 0,
-             "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]}
+        rows = db.query(MusicTrack).order_by(
+            MusicTrack.uses.desc(),
+            MusicTrack.id.desc()
+        ).limit(100).all()
+
+        tracks = []
+
+        for r in rows:
+            # Hide songs whose uploaded audio file no longer exists
+            if r.audio_url and r.audio_url.startswith("/uploads/"):
+                filename = r.audio_url.replace("/uploads/", "", 1)
+                audio_path = UPLOAD_DIR / filename
+
+                if not audio_path.is_file():
+                    continue
+
+            tracks.append({
+                "id": r.id,
+                "title": r.title,
+                "artist": r.artist,
+                "audio_url": r.audio_url,
+                "cover_url": r.cover_url,
+                "uses": r.uses or 0,
+                "created_at": r.created_at.isoformat()
+                    if r.created_at else None
+            })
+
+        return {
+            "success": True,
+            "tracks": tracks
+        }
+
     finally:
         db.close()
-
 @app.post("/music-hub/upload")
 async def upload_music_hub(title: str = Form(...), audio: UploadFile = File(...), authorization: str | None = Header(default=None)):
     user = current_user(authorization)
@@ -1687,18 +1714,54 @@ async def upload_music_hub(title: str = Form(...), audio: UploadFile = File(...)
         db.close()
 
 @app.post("/music-hub/{track_id}/use")
-def use_music_track(track_id: int, authorization: str | None = Header(default=None)):
+def use_music_track(
+    track_id: int,
+    authorization: str | None = Header(default=None)
+):
     user = current_user(authorization)
+
     db = SessionLocal()
+
     try:
-        track = db.query(MusicTrack).filter(MusicTrack.id == track_id).first()
-        if not track: raise HTTPException(404, "Song not found.")
+        track = db.query(MusicTrack).filter(
+            MusicTrack.id == track_id
+        ).first()
+
+        if not track:
+            raise HTTPException(404, "Song not found.")
+
+        # Make sure the uploaded audio still exists
+        if track.audio_url and track.audio_url.startswith("/uploads/"):
+            filename = track.audio_url.replace("/uploads/", "", 1)
+            audio_path = UPLOAD_DIR / filename
+
+            if not audio_path.is_file():
+                raise HTTPException(
+                    404,
+                    "This song file is no longer available."
+                )
+
         track.uses = (track.uses or 0) + 1
-        me = db.query(User).filter(User.id == user.id).first()
+
+        me = db.query(User).filter(
+            User.id == user.id
+        ).first()
+
         if track.owner_id and track.owner_id != user.id:
-            _notify(db, track.owner_id, f"{me.username if me else '@user'} used your song: {track.title}")
+            _notify(
+                db,
+                track.owner_id,
+                f"{me.username if me else '@user'} used your song: {track.title}"
+            )
+
         db.commit()
-        return {"success": True, "uses": track.uses, "track": track.title}
+
+        return {
+            "success": True,
+            "uses": track.uses,
+            "track": track.title
+        }
+
     finally:
         db.close()
 
