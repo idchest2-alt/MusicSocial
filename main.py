@@ -101,6 +101,7 @@ class Post(Base):
     shares = Column(Integer, default=0)
     views = Column(Integer, default=0)
     boost_score = Column(Integer, default=0)
+    repost_of_id = Column(Integer, ForeignKey("posts.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Comment(Base):
@@ -363,15 +364,17 @@ def _ensure_col(table, column, definition):
 
 Base.metadata.create_all(bind=engine)
 
-if DATABASE_URL.startswith("sqlite"):
-    _ensure_col("posts", "views", "INTEGER DEFAULT 0")
-    _ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
-    _ensure_col("users", "referral_code", "VARCHAR")
-    _ensure_col("users", "referred_by_user_id", "INTEGER")
-    _ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
-    _ensure_col("sessions", "expires_at", "DATETIME")
-    _ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
-    _ensure_col("users", "last_seen_at", "DATETIME")
+# Keep existing Railway databases compatible when new columns are added.
+# SQLAlchemy create_all() does not alter an already-existing table.
+_ensure_col("posts", "views", "INTEGER DEFAULT 0")
+_ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
+_ensure_col("posts", "repost_of_id", "INTEGER")
+_ensure_col("users", "referral_code", "VARCHAR")
+_ensure_col("users", "referred_by_user_id", "INTEGER")
+_ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
+_ensure_col("sessions", "expires_at", "DATETIME")
+_ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
+_ensure_col("users", "last_seen_at", "DATETIME")
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
@@ -429,6 +432,8 @@ def post_json(post: Post, liked=False, following=False, hashtags=None):
         "caption": post.caption, "video_url": post.video_url, "music_name": post.music_name,
         "likes": post.likes or 0, "comments": post.comments or 0, "shares": post.shares or 0,
         "views": post.views or 0, "boost_score": post.boost_score or 0,
+        "repost_of_id": post.repost_of_id,
+        "is_repost": post.repost_of_id is not None,
         "liked": liked, "following": following, "hashtags": hashtags or [],
         "created_at": post.created_at.isoformat() if post.created_at else None,
     }
@@ -789,6 +794,131 @@ def get_posts(authorization: str | None = Header(default=None)):
     finally:
         db.close()
 
+@app.post("/posts/{post_id}/repost")
+def repost_post(post_id: int, authorization: str | None = Header(default=None)):
+    """
+    Repost a video without uploading/copying the video file.
+
+    A repost is stored as a normal Post row that points to the original
+    through repost_of_id. Reposting a repost always resolves to the
+    original post, which prevents repost chains.
+    """
+    user = current_user(authorization)
+    db = SessionLocal()
+    try:
+        target = db.query(Post).filter(Post.id == post_id).first()
+        if not target:
+            raise HTTPException(404, "Video not found.")
+
+        # If the selected post is already a repost, repost its original.
+        original_id = target.repost_of_id or target.id
+        original = db.query(Post).filter(Post.id == original_id).first()
+        if not original:
+            raise HTTPException(404, "Original video not found.")
+
+        # One repost per user per original video.
+        existing = (
+            db.query(Post)
+            .filter(
+                Post.user_id == user.id,
+                Post.repost_of_id == original.id,
+            )
+            .first()
+        )
+        if existing:
+            return {
+                "success": True,
+                "already_reposted": True,
+                "post": post_json(existing),
+                "message": "You already reposted this video.",
+            }
+
+        repost = Post(
+            user_id=user.id,
+            username=user.username,
+            caption=original.caption,
+            video_url=original.video_url,
+            music_name=original.music_name,
+            repost_of_id=original.id,
+        )
+        db.add(repost)
+
+        if original.user_id and original.user_id != user.id:
+            _notify(db, original.user_id, f"{user.username} reposted your video")
+
+        db.commit()
+        db.refresh(repost)
+
+        return {
+            "success": True,
+            "already_reposted": False,
+            "post": post_json(repost),
+            "original_post_id": original.id,
+            "message": "Video reposted successfully.",
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError:
+        db.rollback()
+        # Be safe if a database-level uniqueness rule is added later.
+        existing = (
+            db.query(Post)
+            .filter(
+                Post.user_id == user.id,
+                Post.repost_of_id == (post_id),
+            )
+            .first()
+        )
+        if existing:
+            return {
+                "success": True,
+                "already_reposted": True,
+                "post": post_json(existing),
+                "message": "You already reposted this video.",
+            }
+        raise HTTPException(409, "Unable to repost this video.")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Unable to repost video: {e}")
+    finally:
+        db.close()
+
+@app.delete("/posts/{post_id}/repost")
+def unrepost_post(post_id: int, authorization: str | None = Header(default=None)):
+    """Remove the current user's repost of a video."""
+    user = current_user(authorization)
+    db = SessionLocal()
+    try:
+        target = db.query(Post).filter(Post.id == post_id).first()
+        if not target:
+            raise HTTPException(404, "Video not found.")
+
+        original_id = target.repost_of_id or target.id
+        repost = (
+            db.query(Post)
+            .filter(
+                Post.user_id == user.id,
+                Post.repost_of_id == original_id,
+            )
+            .first()
+        )
+        if not repost:
+            return {"success": True, "reposted": False, "message": "Repost not found."}
+
+        repost_id = repost.id
+        db.query(Like).filter(Like.post_id == repost_id).delete(synchronize_session=False)
+        db.query(Comment).filter(Comment.post_id == repost_id).delete(synchronize_session=False)
+        db.query(ViewEvent).filter(ViewEvent.post_id == repost_id).delete(synchronize_session=False)
+        db.query(PostHashtag).filter(PostHashtag.post_id == repost_id).delete(synchronize_session=False)
+        db.query(Promotion).filter(Promotion.post_id == repost_id).delete(synchronize_session=False)
+        db.delete(repost)
+        db.commit()
+
+        return {"success": True, "reposted": False, "post_id": repost_id}
+    finally:
+        db.close()
+
 @app.delete("/posts/{post_id}")
 def delete_post(post_id: int, authorization: str | None = Header(default=None)):
     """Permanently delete a user's post and its related records."""
@@ -804,11 +934,25 @@ def delete_post(post_id: int, authorization: str | None = Header(default=None)):
 
         # Remember a local Railway file so we can remove it after the DB work.
         local_file = None
-        video_url = (post.video_url or "").strip()
-        if video_url.startswith("/uploads/"):
-            local_file = UPLOAD_DIR / Path(video_url).name
+        # Reposts reuse the original video's file, so never delete the file
+        # when a user deletes only their repost.
+        if post.repost_of_id is None:
+            video_url = (post.video_url or "").strip()
+            if video_url.startswith("/uploads/"):
+                local_file = UPLOAD_DIR / Path(video_url).name
 
         # Remove records that reference this post before deleting the post itself.
+        # Remove reposts of this post first so the original can be deleted safely.
+        repost_rows = db.query(Post).filter(Post.repost_of_id == post_id).all()
+        for repost in repost_rows:
+            repost_id = repost.id
+            db.query(Like).filter(Like.post_id == repost_id).delete(synchronize_session=False)
+            db.query(Comment).filter(Comment.post_id == repost_id).delete(synchronize_session=False)
+            db.query(ViewEvent).filter(ViewEvent.post_id == repost_id).delete(synchronize_session=False)
+            db.query(PostHashtag).filter(PostHashtag.post_id == repost_id).delete(synchronize_session=False)
+            db.query(Promotion).filter(Promotion.post_id == repost_id).delete(synchronize_session=False)
+            db.delete(repost)
+
         db.query(Like).filter(Like.post_id == post_id).delete(synchronize_session=False)
         db.query(Comment).filter(Comment.post_id == post_id).delete(synchronize_session=False)
         db.query(ViewEvent).filter(ViewEvent.post_id == post_id).delete(synchronize_session=False)
