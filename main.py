@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timedelta
@@ -101,7 +101,6 @@ class Post(Base):
     shares = Column(Integer, default=0)
     views = Column(Integer, default=0)
     boost_score = Column(Integer, default=0)
-    repost_of_id = Column(Integer, ForeignKey("posts.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Comment(Base):
@@ -204,6 +203,17 @@ class MusicTrack(Base):
     artist = Column(String, default="")
     audio_url = Column(String, nullable=False)
     cover_url = Column(String, default="")
+    proof_url = Column(String, default="")
+    isrc = Column(String, default="", index=True)
+    audio_sha256 = Column(String, default="", index=True)
+    ownership_confirmed = Column(Integer, default=0)
+    verification_status = Column(String, default="pending", index=True)
+    verification_notes = Column(Text, default="")
+    fingerprint_match_id = Column(Integer, nullable=True)
+    identity_match = Column(Integer, default=0)
+    proof_submitted = Column(Integer, default=0)
+    verified_at = Column(DateTime, nullable=True)
+    verified_by = Column(Integer, nullable=True)
     uses = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -364,17 +374,28 @@ def _ensure_col(table, column, definition):
 
 Base.metadata.create_all(bind=engine)
 
-# Keep existing Railway databases compatible when new columns are added.
-# SQLAlchemy create_all() does not alter an already-existing table.
-_ensure_col("posts", "views", "INTEGER DEFAULT 0")
-_ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
-_ensure_col("posts", "repost_of_id", "INTEGER")
-_ensure_col("users", "referral_code", "VARCHAR")
-_ensure_col("users", "referred_by_user_id", "INTEGER")
-_ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
-_ensure_col("sessions", "expires_at", "DATETIME")
-_ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
-_ensure_col("users", "last_seen_at", "DATETIME")
+# Music ownership / copyright verification migrations.
+_ensure_col("music_tracks", "proof_url", "VARCHAR DEFAULT ''")
+_ensure_col("music_tracks", "isrc", "VARCHAR DEFAULT ''")
+_ensure_col("music_tracks", "audio_sha256", "VARCHAR DEFAULT ''")
+_ensure_col("music_tracks", "ownership_confirmed", "INTEGER DEFAULT 0")
+_ensure_col("music_tracks", "verification_status", "VARCHAR DEFAULT 'pending'")
+_ensure_col("music_tracks", "verification_notes", "TEXT DEFAULT ''")
+_ensure_col("music_tracks", "fingerprint_match_id", "INTEGER")
+_ensure_col("music_tracks", "identity_match", "INTEGER DEFAULT 0")
+_ensure_col("music_tracks", "proof_submitted", "INTEGER DEFAULT 0")
+_ensure_col("music_tracks", "verified_at", "DATETIME")
+_ensure_col("music_tracks", "verified_by", "INTEGER")
+
+if DATABASE_URL.startswith("sqlite"):
+    _ensure_col("posts", "views", "INTEGER DEFAULT 0")
+    _ensure_col("posts", "boost_score", "INTEGER DEFAULT 0")
+    _ensure_col("users", "referral_code", "VARCHAR")
+    _ensure_col("users", "referred_by_user_id", "INTEGER")
+    _ensure_col("users", "referral_coins", "INTEGER DEFAULT 0")
+    _ensure_col("sessions", "expires_at", "DATETIME")
+    _ensure_col("users", "is_verified", "INTEGER DEFAULT 0")
+    _ensure_col("users", "last_seen_at", "DATETIME")
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
@@ -432,8 +453,6 @@ def post_json(post: Post, liked=False, following=False, hashtags=None):
         "caption": post.caption, "video_url": post.video_url, "music_name": post.music_name,
         "likes": post.likes or 0, "comments": post.comments or 0, "shares": post.shares or 0,
         "views": post.views or 0, "boost_score": post.boost_score or 0,
-        "repost_of_id": post.repost_of_id,
-        "is_repost": post.repost_of_id is not None,
         "liked": liked, "following": following, "hashtags": hashtags or [],
         "created_at": post.created_at.isoformat() if post.created_at else None,
     }
@@ -794,131 +813,6 @@ def get_posts(authorization: str | None = Header(default=None)):
     finally:
         db.close()
 
-@app.post("/posts/{post_id}/repost")
-def repost_post(post_id: int, authorization: str | None = Header(default=None)):
-    """
-    Repost a video without uploading/copying the video file.
-
-    A repost is stored as a normal Post row that points to the original
-    through repost_of_id. Reposting a repost always resolves to the
-    original post, which prevents repost chains.
-    """
-    user = current_user(authorization)
-    db = SessionLocal()
-    try:
-        target = db.query(Post).filter(Post.id == post_id).first()
-        if not target:
-            raise HTTPException(404, "Video not found.")
-
-        # If the selected post is already a repost, repost its original.
-        original_id = target.repost_of_id or target.id
-        original = db.query(Post).filter(Post.id == original_id).first()
-        if not original:
-            raise HTTPException(404, "Original video not found.")
-
-        # One repost per user per original video.
-        existing = (
-            db.query(Post)
-            .filter(
-                Post.user_id == user.id,
-                Post.repost_of_id == original.id,
-            )
-            .first()
-        )
-        if existing:
-            return {
-                "success": True,
-                "already_reposted": True,
-                "post": post_json(existing),
-                "message": "You already reposted this video.",
-            }
-
-        repost = Post(
-            user_id=user.id,
-            username=user.username,
-            caption=original.caption,
-            video_url=original.video_url,
-            music_name=original.music_name,
-            repost_of_id=original.id,
-        )
-        db.add(repost)
-
-        if original.user_id and original.user_id != user.id:
-            _notify(db, original.user_id, f"{user.username} reposted your video")
-
-        db.commit()
-        db.refresh(repost)
-
-        return {
-            "success": True,
-            "already_reposted": False,
-            "post": post_json(repost),
-            "original_post_id": original.id,
-            "message": "Video reposted successfully.",
-        }
-    except HTTPException:
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        # Be safe if a database-level uniqueness rule is added later.
-        existing = (
-            db.query(Post)
-            .filter(
-                Post.user_id == user.id,
-                Post.repost_of_id == (post_id),
-            )
-            .first()
-        )
-        if existing:
-            return {
-                "success": True,
-                "already_reposted": True,
-                "post": post_json(existing),
-                "message": "You already reposted this video.",
-            }
-        raise HTTPException(409, "Unable to repost this video.")
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"Unable to repost video: {e}")
-    finally:
-        db.close()
-
-@app.delete("/posts/{post_id}/repost")
-def unrepost_post(post_id: int, authorization: str | None = Header(default=None)):
-    """Remove the current user's repost of a video."""
-    user = current_user(authorization)
-    db = SessionLocal()
-    try:
-        target = db.query(Post).filter(Post.id == post_id).first()
-        if not target:
-            raise HTTPException(404, "Video not found.")
-
-        original_id = target.repost_of_id or target.id
-        repost = (
-            db.query(Post)
-            .filter(
-                Post.user_id == user.id,
-                Post.repost_of_id == original_id,
-            )
-            .first()
-        )
-        if not repost:
-            return {"success": True, "reposted": False, "message": "Repost not found."}
-
-        repost_id = repost.id
-        db.query(Like).filter(Like.post_id == repost_id).delete(synchronize_session=False)
-        db.query(Comment).filter(Comment.post_id == repost_id).delete(synchronize_session=False)
-        db.query(ViewEvent).filter(ViewEvent.post_id == repost_id).delete(synchronize_session=False)
-        db.query(PostHashtag).filter(PostHashtag.post_id == repost_id).delete(synchronize_session=False)
-        db.query(Promotion).filter(Promotion.post_id == repost_id).delete(synchronize_session=False)
-        db.delete(repost)
-        db.commit()
-
-        return {"success": True, "reposted": False, "post_id": repost_id}
-    finally:
-        db.close()
-
 @app.delete("/posts/{post_id}")
 def delete_post(post_id: int, authorization: str | None = Header(default=None)):
     """Permanently delete a user's post and its related records."""
@@ -934,25 +828,11 @@ def delete_post(post_id: int, authorization: str | None = Header(default=None)):
 
         # Remember a local Railway file so we can remove it after the DB work.
         local_file = None
-        # Reposts reuse the original video's file, so never delete the file
-        # when a user deletes only their repost.
-        if post.repost_of_id is None:
-            video_url = (post.video_url or "").strip()
-            if video_url.startswith("/uploads/"):
-                local_file = UPLOAD_DIR / Path(video_url).name
+        video_url = (post.video_url or "").strip()
+        if video_url.startswith("/uploads/"):
+            local_file = UPLOAD_DIR / Path(video_url).name
 
         # Remove records that reference this post before deleting the post itself.
-        # Remove reposts of this post first so the original can be deleted safely.
-        repost_rows = db.query(Post).filter(Post.repost_of_id == post_id).all()
-        for repost in repost_rows:
-            repost_id = repost.id
-            db.query(Like).filter(Like.post_id == repost_id).delete(synchronize_session=False)
-            db.query(Comment).filter(Comment.post_id == repost_id).delete(synchronize_session=False)
-            db.query(ViewEvent).filter(ViewEvent.post_id == repost_id).delete(synchronize_session=False)
-            db.query(PostHashtag).filter(PostHashtag.post_id == repost_id).delete(synchronize_session=False)
-            db.query(Promotion).filter(Promotion.post_id == repost_id).delete(synchronize_session=False)
-            db.delete(repost)
-
         db.query(Like).filter(Like.post_id == post_id).delete(synchronize_session=False)
         db.query(Comment).filter(Comment.post_id == post_id).delete(synchronize_session=False)
         db.query(ViewEvent).filter(ViewEvent.post_id == post_id).delete(synchronize_session=False)
@@ -1435,9 +1315,10 @@ def trending_hashtags(limit: int = 20):
 def trending_music(limit: int = 20):
     db = SessionLocal()
     try:
-        rows = db.query(MusicTrack).order_by(MusicTrack.uses.desc(), MusicTrack.id.desc()).limit(max(1, min(limit, 50))).all()
-        return {"success": True, "music": [{"id": r.id, "title": r.title, "artist": r.artist, "uses": r.uses or 0, "audio_url": r.audio_url} for r in rows]}
-    finally: db.close()
+        rows = db.query(MusicTrack).filter(MusicTrack.verification_status == "verified").order_by(MusicTrack.uses.desc(), MusicTrack.id.desc()).limit(max(1, min(limit, 50))).all()
+        return {"success": True, "music": [{"id": r.id, "title": r.title, "artist": r.artist, "uses": r.uses or 0, "audio_url": f"/music-hub/{r.id}/audio", "cover_url": r.cover_url or "", "verification_status": r.verification_status or "pending"} for r in rows]}
+    finally:
+        db.close()
 
 @app.get("/feed/for-you")
 def for_you_feed(authorization: str | None = Header(default=None)):
@@ -1731,76 +1612,145 @@ def request_withdrawal(amount_naira: int = Form(...), bank_name: str = Form(...)
     finally:
         db.close()
 
+def music_track_json(r):
+    return {
+        "id": r.id, "owner_id": r.owner_id, "title": r.title, "artist": r.artist,
+        "audio_url": f"/music-hub/{r.id}/audio", "cover_url": r.cover_url or "",
+        "uses": r.uses or 0, "created_at": r.created_at.isoformat() if r.created_at else None,
+        "audio_available": bool(r.audio_url and (not r.audio_url.startswith("/uploads/") or (UPLOAD_DIR / Path(r.audio_url).name).exists())),
+        "isrc": r.isrc or "", "ownership_confirmed": bool(r.ownership_confirmed),
+        "verification_status": r.verification_status or "pending", "verification_notes": r.verification_notes or "",
+        "identity_match": bool(r.identity_match), "proof_submitted": bool(r.proof_submitted),
+        "fingerprint_match_id": r.fingerprint_match_id, "verified_at": r.verified_at.isoformat() if r.verified_at else None,
+    }
+
 @app.get("/music-hub")
-def music_hub():
+def music_hub(authorization: str | None = Header(default=None)):
     db = SessionLocal()
     try:
-        rows = db.query(MusicTrack).order_by(MusicTrack.uses.desc(), MusicTrack.id.desc()).limit(100).all()
-        return {"success": True, "tracks": [
-            {"id": r.id, "title": r.title, "artist": r.artist, "audio_url": r.audio_url,
-             "cover_url": r.cover_url, "uses": r.uses or 0,
-             "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]}
-    finally:
-        db.close()
+        my_id = None
+        if authorization:
+            try: my_id = current_user(authorization).id
+            except HTTPException: my_id = None
+        query = db.query(MusicTrack)
+        if my_id is not None:
+            from sqlalchemy import or_
+            query = query.filter(or_(MusicTrack.verification_status == "verified", MusicTrack.owner_id == my_id))
+        else:
+            query = query.filter(MusicTrack.verification_status == "verified")
+        rows = query.order_by(MusicTrack.uses.desc(), MusicTrack.id.desc()).limit(100).all()
+        return {"success": True, "tracks": [music_track_json(r) for r in rows]}
+    finally: db.close()
+
+@app.get("/music-hub/{track_id}/audio")
+def music_track_audio(track_id: int, authorization: str | None = Header(default=None)):
+    db = SessionLocal()
+    try:
+        track = db.query(MusicTrack).filter(MusicTrack.id == track_id).first()
+        if not track: raise HTTPException(404, "Song not found.")
+        owner_id = None
+        if authorization:
+            try: owner_id = current_user(authorization).id
+            except HTTPException: owner_id = None
+        if track.verification_status != "verified" and track.owner_id != owner_id:
+            raise HTTPException(403, "This song is still awaiting ownership verification.")
+        if not track.audio_url.startswith("/uploads/"): raise HTTPException(404, "Audio file not found.")
+        path = UPLOAD_DIR / Path(track.audio_url).name
+        if not path.exists(): raise HTTPException(404, "Audio file not found.")
+        from fastapi.responses import FileResponse
+        return FileResponse(path)
+    finally: db.close()
 
 @app.post("/music-hub/upload")
-async def upload_music_hub(title: str = Form(...), audio: UploadFile = File(...), authorization: str | None = Header(default=None)):
+async def upload_music_hub(title: str = Form(...), artist: str = Form(""), isrc: str = Form(""), owner_confirmed: str = Form("false"), audio: UploadFile = File(...), cover: UploadFile = File(...), proof: UploadFile | None = File(default=None), authorization: str | None = Header(default=None)):
     user = current_user(authorization)
-    if not audio.content_type or not audio.content_type.startswith("audio/"):
-        raise HTTPException(400, "Please choose an audio file.")
-    data = await audio.read(25 * 1024 * 1024 + 1)
-    if len(data) > 25 * 1024 * 1024: raise HTTPException(413, "Audio file is too large (max 25 MB).")
-    ext = Path(audio.filename or "song.mp3").suffix.lower() or ".mp3"
-    name = f"song_{uuid.uuid4().hex}{ext}"; path = UPLOAD_DIR / name; path.write_bytes(data)
-    db = SessionLocal()
+    if not audio.content_type or not audio.content_type.startswith("audio/"): raise HTTPException(400, "Please choose an audio file.")
+    if not cover.content_type or not cover.content_type.startswith("image/"): raise HTTPException(400, "A song cover image is required.")
+    if str(owner_confirmed).strip().lower() not in {"true", "1", "yes", "on"}: raise HTTPException(400, "You must confirm that you own the rights to this song.")
+    title = title.strip()[:120]; clean_artist = artist.strip()[:120] or user.username; clean_isrc = isrc.strip().upper()[:32]
+    if not title: raise HTTPException(400, "Song title is required.")
+    audio_data = await audio.read(25 * 1024 * 1024 + 1); cover_data = await cover.read(8 * 1024 * 1024 + 1); proof_data = await proof.read(15 * 1024 * 1024 + 1) if proof else b""
+    if len(audio_data) > 25 * 1024 * 1024: raise HTTPException(413, "Audio file is too large (max 25 MB).")
+    if len(cover_data) > 8 * 1024 * 1024: raise HTTPException(413, "Cover image is too large (max 8 MB).")
+    if proof and len(proof_data) > 15 * 1024 * 1024: raise HTTPException(413, "Proof file is too large (max 15 MB).")
+    fingerprint = hashlib.sha256(audio_data).hexdigest(); db = SessionLocal(); paths = []
     try:
-        row = db.query(User).filter(User.id == user.id).first()
-        _spend_coins(row, MUSIC_UPLOAD_COST)
-        track = MusicTrack(owner_id=user.id, title=title.strip()[:120], artist=user.username, audio_url=f"/uploads/{name}")
+        duplicate = db.query(MusicTrack).filter(MusicTrack.audio_sha256 == fingerprint).first()
+        if duplicate: raise HTTPException(409, f"This audio file already exists in MusicSocial as '{duplicate.title}'.")
+        identity_match = clean_artist.lower().lstrip("@").strip() in {(user.username or "").lower().lstrip("@").strip(), (getattr(user, "email", "") or "").split("@")[0].lower().strip()}
+        audio_ext = Path(audio.filename or "song.mp3").suffix.lower() or ".mp3"; cover_ext = Path(cover.filename or "cover.jpg").suffix.lower() or ".jpg"
+        audio_name = f"song_{uuid.uuid4().hex}{audio_ext}"; cover_name = f"cover_{uuid.uuid4().hex}{cover_ext}"
+        audio_path = UPLOAD_DIR / audio_name; cover_path = UPLOAD_DIR / cover_name; audio_path.write_bytes(audio_data); cover_path.write_bytes(cover_data); paths.extend([audio_path, cover_path])
+        proof_url = ""
+        if proof and proof.filename and proof_data:
+            proof_ext = Path(proof.filename).suffix.lower() or ".bin"; proof_name = f"proof_{uuid.uuid4().hex}{proof_ext}"; proof_path = UPLOAD_DIR / proof_name; proof_path.write_bytes(proof_data); paths.append(proof_path); proof_url = f"/uploads/{proof_name}"
+        notes = ["Ownership declaration received.", "Exact audio fingerprint checked: no duplicate found.", "Artist identity matched." if identity_match else "Artist identity did not automatically match uploader profile.", "Proof of ownership submitted." if proof_url else "No proof of ownership submitted.", "ISRC supplied." if clean_isrc else "No ISRC supplied."]
+        row = db.query(User).filter(User.id == user.id).first(); _spend_coins(row, MUSIC_UPLOAD_COST)
+        track = MusicTrack(owner_id=user.id, title=title, artist=clean_artist, audio_url=f"/uploads/{audio_name}", cover_url=f"/uploads/{cover_name}", proof_url=proof_url, isrc=clean_isrc, audio_sha256=fingerprint, ownership_confirmed=1, verification_status="pending", verification_notes=" ".join(notes), identity_match=1 if identity_match else 0, proof_submitted=1 if proof_url else 0, uses=0)
         db.add(track); db.commit(); db.refresh(track)
-        return {"success": True, "credits": public_credits(row), "upload_cost": MUSIC_UPLOAD_COST,
-                "track": {"id": track.id, "title": track.title, "artist": track.artist, "audio_url": track.audio_url, "uses": 0}}
-    except Exception:
-        db.rollback(); path.unlink(missing_ok=True); raise
+        return {"success": True, "verification_status": "pending", "message": "Song submitted for ownership review. It will appear in Music Hub after owner verification.", "credits": public_credits(row), "upload_cost": MUSIC_UPLOAD_COST, "track": music_track_json(track)}
+    except HTTPException:
+        db.rollback(); [path.unlink(missing_ok=True) for path in paths]; raise
+    except Exception as e:
+        db.rollback(); [path.unlink(missing_ok=True) for path in paths]; raise HTTPException(500, f"Song upload failed: {e}")
     finally:
+        await audio.close(); await cover.close();
+        if proof: await proof.close()
         db.close()
 
 @app.delete("/music-hub/{track_id}")
 def delete_music_track(track_id: int, authorization: str | None = Header(default=None)):
-    """Delete a creator's uploaded song from Music Hub."""
+    user = current_user(authorization); db = SessionLocal()
+    try:
+        track = db.query(MusicTrack).filter(MusicTrack.id == track_id).first()
+        if not track: raise HTTPException(404, "Song not found.")
+        if track.owner_id != user.id: raise HTTPException(403, "You can only delete your own uploaded songs.")
+        media_paths = [UPLOAD_DIR / Path(url).name for url in (track.audio_url, track.cover_url, track.proof_url) if url and url.startswith("/uploads/")]
+        db.delete(track); db.commit()
+        for local_file in media_paths:
+            if local_file.exists():
+                try: local_file.unlink()
+                except OSError: pass
+        return {"success": True, "track_id": track_id, "message": "Song deleted successfully."}
+    except HTTPException: db.rollback(); raise
+    except Exception as e: db.rollback(); raise HTTPException(500, f"Unable to delete song: {e}")
+    finally: db.close()
+
+@app.get("/owner/music-verifications")
+def owner_music_verifications(authorization: str | None = Header(default=None)):
     user = current_user(authorization)
+    if not is_owner(user): raise HTTPException(403, "Owner access required.")
+    db = SessionLocal()
+    try:
+        rows = db.query(MusicTrack).order_by(MusicTrack.id.desc()).limit(500).all()
+        summary = {"pending": sum(1 for r in rows if r.verification_status == "pending"), "verified": sum(1 for r in rows if r.verification_status == "verified"), "rejected": sum(1 for r in rows if r.verification_status == "rejected"), "total": len(rows)}
+        return {"success": True, "summary": summary, "tracks": [music_track_json(r) | {"proof_url": r.proof_url or "", "audio_sha256": r.audio_sha256 or ""} for r in rows]}
+    finally: db.close()
+
+@app.post("/owner/music-verifications/{track_id}/confirm")
+def owner_confirm_music(track_id: int, authorization: str | None = Header(default=None)):
+    user = current_user(authorization)
+    if not is_owner(user): raise HTTPException(403, "Owner access required.")
     db = SessionLocal()
     try:
         track = db.query(MusicTrack).filter(MusicTrack.id == track_id).first()
-        if not track:
-            raise HTTPException(404, "Song not found.")
+        if not track: raise HTTPException(404, "Song submission not found.")
+        if not track.ownership_confirmed: raise HTTPException(400, "Uploader did not confirm ownership.")
+        track.verification_status = "verified"; track.verified_at = datetime.utcnow(); track.verified_by = user.id; track.verification_notes = (track.verification_notes or "") + " Owner manually confirmed ownership."
+        db.commit(); return {"success": True, "message": "Owner confirmed. Song is now verified.", "track": music_track_json(track)}
+    finally: db.close()
 
-        if track.owner_id != user.id:
-            raise HTTPException(403, "You can only delete your own uploaded songs.")
-
-        local_file = None
-        audio_url = (track.audio_url or "").strip()
-        if audio_url.startswith("/uploads/"):
-            local_file = UPLOAD_DIR / Path(audio_url).name
-
-        db.delete(track)
-        db.commit()
-
-        if local_file and local_file.exists():
-            try:
-                local_file.unlink()
-            except OSError:
-                pass
-
-        return {"success": True, "track_id": track_id, "message": "Song deleted successfully."}
-    except HTTPException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"Unable to delete song: {e}")
-    finally:
-        db.close()
+@app.post("/owner/music-verifications/{track_id}/reject")
+def owner_reject_music(track_id: int, reason: str = Form("Rejected by owner during copyright review."), authorization: str | None = Header(default=None)):
+    user = current_user(authorization)
+    if not is_owner(user): raise HTTPException(403, "Owner access required.")
+    db = SessionLocal()
+    try:
+        track = db.query(MusicTrack).filter(MusicTrack.id == track_id).first()
+        if not track: raise HTTPException(404, "Song submission not found.")
+        track.verification_status = "rejected"; track.verified_at = datetime.utcnow(); track.verified_by = user.id; track.verification_notes = (track.verification_notes or "") + f" Owner rejected: {reason.strip()[:500]}"
+        db.commit(); return {"success": True, "message": "Song rejected.", "track": music_track_json(track)}
+    finally: db.close()
 
 @app.post("/music-hub/{track_id}/use")
 def use_music_track(track_id: int, authorization: str | None = Header(default=None)):
