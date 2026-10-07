@@ -25,7 +25,7 @@ PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
 PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY", "")
 PAYSTACK_BASE_URL = "https://api.paystack.co"
 OWNER_EMAIL = os.getenv("MUSICSOCIAL_OWNER_EMAIL", "").strip().lower()
-OWNER_USERNAME = os.getenv("MUSICSOCIAL_OWNER_USERNAME", "").strip()
+OWNER_USERNAME = os.getenv("MUSICSOCIAL_OWNER_USERNAME", "@idchest").strip()
 if OWNER_USERNAME and not OWNER_USERNAME.startswith("@"):
     OWNER_USERNAME = "@" + OWNER_USERNAME
 
@@ -147,6 +147,15 @@ class Repost(Base):
     __table_args__ = (UniqueConstraint("user_id", "post_id", name="uq_user_post_repost"),)
 
 
+class Bookmark(Base):
+    __tablename__ = "bookmarks"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "post_id", name="uq_user_post_bookmark"),)
+
+
 class Follow(Base):
     __tablename__ = "follows"
     id = Column(Integer, primary_key=True)
@@ -240,6 +249,15 @@ class MusicTrack(Base):
     audio_url = Column(String, nullable=False)
     cover_url = Column(String, default="")
     uses = Column(Integer, default=0)
+    isrc = Column(String, default="")
+    ownership_confirmed = Column(Integer, default=0)
+    verification_status = Column(String, default="pending")
+    verification_notes = Column(String, default="")
+    identity_match = Column(Integer, default=0)
+    proof_url = Column(String, default="")
+    audio_sha256 = Column(String, default="")
+    fingerprint_match_id = Column(Integer, nullable=True)
+    verified_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -416,11 +434,27 @@ for _table, _column, _definition in [
     ("sessions", "expires_at", "DATETIME"),
     ("music_tracks", "cover_url", "VARCHAR DEFAULT ''"),
     ("music_tracks", "uses", "INTEGER DEFAULT 0"),
+    ("music_tracks", "isrc", "VARCHAR DEFAULT ''"),
+    ("music_tracks", "ownership_confirmed", "INTEGER DEFAULT 0"),
+    ("music_tracks", "verification_status", "VARCHAR DEFAULT 'pending'"),
+    ("music_tracks", "verification_notes", "VARCHAR DEFAULT ''"),
+    ("music_tracks", "identity_match", "INTEGER DEFAULT 0"),
+    ("music_tracks", "proof_url", "VARCHAR DEFAULT ''"),
+    ("music_tracks", "audio_sha256", "VARCHAR DEFAULT ''"),
+    ("music_tracks", "fingerprint_match_id", "INTEGER"),
+    ("music_tracks", "verified_at", "DATETIME"),
 ]:
     try:
         ensure_col(_table, _column, _definition)
     except Exception as e:
         print(f"Migration warning for {_table}.{_column}: {e}")
+
+# Existing sessions also become persistent. They are still revoked by /auth/logout.
+try:
+    with engine.begin() as _conn:
+        _conn.exec_driver_sql('UPDATE sessions SET expires_at = NULL')
+except Exception as _e:
+    print(f"Session persistence migration warning: {_e}")
 
 
 def hash_password(password: str) -> str:
@@ -451,10 +485,8 @@ def current_user(authorization: str | None) -> User:
         session = db.query(SessionToken).filter(SessionToken.token == token).first()
         if not session:
             raise HTTPException(401, "Your session is invalid. Please sign in again.")
-        if session.expires_at and session.expires_at <= datetime.utcnow():
-            db.delete(session)
-            db.commit()
-            raise HTTPException(401, "Your session has expired. Please sign in again.")
+        # MusicSocial sessions are persistent until the user explicitly logs out.
+        # Keep this check intentionally disabled so closing the app does not sign users out.
         user = db.query(User).filter(User.id == session.user_id).first()
         if not user:
             raise HTTPException(401, "Account not found.")
@@ -476,8 +508,8 @@ def public_user_json(user: User):
     return {"id": user.id, "username": user.username, "bio": user.bio or "", "avatar_url": user.avatar_url or "", "is_verified": bool(getattr(user, "is_verified", 0))}
 
 
-def post_json(post: Post, liked=False, following=False, hashtags=None, reposted=False):
-    return {"id": post.id, "user_id": post.user_id, "username": post.username, "caption": post.caption or "", "video_url": post.video_url, "music_name": post.music_name or "Original Sound", "likes": post.likes or 0, "comments": post.comments or 0, "shares": post.shares or 0, "views": post.views or 0, "boost_score": post.boost_score or 0, "liked": liked, "following": following, "hashtags": hashtags or [], "repost_of_id": post.repost_of_id, "is_repost": bool(post.repost_of_id), "reposted": reposted, "repost_count": post.repost_count or 0, "created_at": post.created_at.isoformat() if post.created_at else None}
+def post_json(post: Post, liked=False, following=False, hashtags=None, reposted=False, bookmarked=False, bookmark_count=0):
+    return {"id": post.id, "user_id": post.user_id, "username": post.username, "caption": post.caption or "", "video_url": post.video_url, "music_name": post.music_name or "Original Sound", "likes": post.likes or 0, "comments": post.comments or 0, "shares": post.shares or 0, "views": post.views or 0, "boost_score": post.boost_score or 0, "liked": liked, "following": following, "hashtags": hashtags or [], "repost_of_id": post.repost_of_id, "is_repost": bool(post.repost_of_id), "reposted": reposted, "repost_count": post.repost_count or 0, "bookmarked": bookmarked, "bookmark_count": bookmark_count, "created_at": post.created_at.isoformat() if post.created_at else None}
 
 
 def _spend_coins(user: User, amount: int):
@@ -516,7 +548,7 @@ def _save_hashtags(db, post: Post, caption: str):
 
 def _issue_token(db, user: User):
     token = secrets.token_urlsafe(32)
-    db.add(SessionToken(user_id=user.id, token=token, expires_at=datetime.utcnow() + timedelta(days=30)))
+    db.add(SessionToken(user_id=user.id, token=token, expires_at=None))
     db.commit()
     return token
 
@@ -765,8 +797,12 @@ def get_posts(authorization: str | None = Header(default=None)):
         rows = [p for p in rows if p.user_id not in blocked]
         liked_ids = {x.post_id for x in db.query(Like).filter(Like.user_id == viewer.id).all()} if viewer else set()
         reposted_ids = {x.post_id for x in db.query(Repost).filter(Repost.user_id == viewer.id).all()} if viewer else set()
+        bookmarked_ids = {x.post_id for x in db.query(Bookmark).filter(Bookmark.user_id == viewer.id).all()} if viewer else set()
         following_ids = {x.following_id for x in db.query(Follow).filter(Follow.follower_id == viewer.id).all()} if viewer else set()
-        return {"success": True, "posts": [post_json(p,p.id in liked_ids,p.user_id in following_ids,_hashtags(db,p),(p.repost_of_id or p.id) in reposted_ids) for p in rows]}
+        def _pj(p):
+            source_id = p.repost_of_id or p.id
+            return post_json(p, p.id in liked_ids, p.user_id in following_ids, _hashtags(db,p), source_id in reposted_ids, source_id in bookmarked_ids, db.query(Bookmark).filter(Bookmark.post_id == source_id).count())
+        return {"success": True, "posts": [_pj(p) for p in rows]}
     finally: db.close()
 
 
@@ -810,6 +846,7 @@ def delete_post(post_id: int, authorization: str | None = Header(default=None)):
             db.query(Repost).filter(Repost.post_id == copy.id).delete(synchronize_session=False)
             db.query(ViewEvent).filter(ViewEvent.post_id == copy.id).delete(synchronize_session=False)
             db.query(PostHashtag).filter(PostHashtag.post_id == copy.id).delete(synchronize_session=False)
+            db.query(Bookmark).filter(Bookmark.post_id == copy.id).delete(synchronize_session=False)
             db.query(Promotion).filter(Promotion.post_id == copy.id).delete(synchronize_session=False)
             db.delete(copy)
         db.query(Comment).filter(Comment.post_id==post.id).delete(synchronize_session=False)
@@ -817,6 +854,7 @@ def delete_post(post_id: int, authorization: str | None = Header(default=None)):
         db.query(Repost).filter(Repost.post_id==post.id).delete(synchronize_session=False)
         db.query(ViewEvent).filter(ViewEvent.post_id==post.id).delete(synchronize_session=False)
         db.query(PostHashtag).filter(PostHashtag.post_id==post.id).delete(synchronize_session=False)
+        db.query(Bookmark).filter(Bookmark.post_id==post.id).delete(synchronize_session=False)
         db.query(Promotion).filter(Promotion.post_id==post.id).delete(synchronize_session=False)
         db.delete(post)
         db.commit()
@@ -894,6 +932,35 @@ def repost_post(post_id:int,authorization:str|None=Header(default=None)):
         return {"success":True,"already_reposted":False,"repost_count":source.repost_count}
     finally: db.close()
 
+
+@app.post("/posts/{post_id}/bookmark")
+def bookmark_post(post_id:int,authorization:str|None=Header(default=None)):
+    me=current_user(authorization); db=SessionLocal()
+    try:
+        post=db.query(Post).filter(Post.id==post_id).first()
+        if not post: raise HTTPException(404,"Video not found.")
+        source_id=post.repost_of_id or post.id
+        exists=db.query(Bookmark).filter(Bookmark.user_id==me.id,Bookmark.post_id==source_id).first()
+        if exists:
+            db.delete(exists); bookmarked=False
+        else:
+            db.add(Bookmark(user_id=me.id,post_id=source_id)); bookmarked=True
+        db.commit(); count=db.query(Bookmark).filter(Bookmark.post_id==source_id).count()
+        return {"success":True,"bookmarked":bookmarked,"bookmark_count":count}
+    finally: db.close()
+
+@app.get("/bookmarks")
+def get_bookmarks(authorization:str|None=Header(default=None)):
+    me=current_user(authorization); db=SessionLocal()
+    try:
+        rows=db.query(Bookmark).filter(Bookmark.user_id==me.id).order_by(Bookmark.id.desc()).limit(200).all()
+        out=[]
+        for b in rows:
+            p=db.query(Post).filter(Post.id==b.post_id).first()
+            if not p: continue
+            out.append(post_json(p,db.query(Like).filter(Like.user_id==me.id,Like.post_id==p.id).first() is not None,False,_hashtags(db,p),db.query(Repost).filter(Repost.user_id==me.id,Repost.post_id==(p.repost_of_id or p.id)).first() is not None,True,db.query(Bookmark).filter(Bookmark.post_id==p.id).count()))
+        return {"success":True,"posts":out}
+    finally: db.close()
 
 @app.get("/shared/posts/{post_id}",response_class=HTMLResponse)
 def shared_post(post_id:int):
@@ -1060,11 +1127,37 @@ def music_feed(title:str):
 
 
 @app.get("/search")
-def search_all(q:str=""):
+def search_all(q:str="", authorization:str|None=Header(default=None)):
     q=q.strip(); db=SessionLocal()
     try:
-        users=db.query(User).filter(User.username.ilike(f"%{q}%")).limit(20).all() if q else []; posts=db.query(Post).filter(or_(Post.caption.ilike(f"%{q}%"),Post.username.ilike(f"%{q}%"),Post.music_name.ilike(f"%{q}%"))).order_by(Post.id.desc()).limit(30).all() if q else []
-        return {"success":True,"users":[public_user_json(u) for u in users],"posts":[post_json(p) for p in posts]}
+        viewer=None
+        if authorization:
+            try: viewer=current_user(authorization)
+            except HTTPException: pass
+        if not q:
+            return {"success":True,"users":[],"posts":[]}
+        term=q.lstrip("#").strip()
+        like=f"%{term}%"
+        users=db.query(User).filter(or_(User.username.ilike(like),User.bio.ilike(like))).order_by(User.id.desc()).limit(30).all()
+        posts=db.query(Post).filter(or_(Post.caption.ilike(like),Post.username.ilike(like),Post.music_name.ilike(like))).order_by(Post.id.desc()).limit(50).all()
+        if q.startswith("#"):
+            tagged=db.query(PostHashtag).filter(PostHashtag.hashtag==term.lower()).all()
+            tagged_ids={x.post_id for x in tagged}
+            posts=[p for p in db.query(Post).filter(Post.id.in_(tagged_ids)).order_by(Post.id.desc()).limit(50).all()] if tagged_ids else []
+        blocked=_blocked_ids(db,viewer.id) if viewer else set()
+        posts=[p for p in posts if p.user_id not in blocked]
+        liked_ids={x.post_id for x in db.query(Like).filter(Like.user_id==viewer.id).all()} if viewer else set()
+        reposted_ids={x.post_id for x in db.query(Repost).filter(Repost.user_id==viewer.id).all()} if viewer else set()
+        bookmarked_ids={x.post_id for x in db.query(Bookmark).filter(Bookmark.user_id==viewer.id).all()} if viewer else set()
+        following_ids={x.following_id for x in db.query(Follow).filter(Follow.follower_id==viewer.id).all()} if viewer else set()
+        result=[]
+        for p in posts:
+            source_id=p.repost_of_id or p.id
+            result.append(post_json(p,p.id in liked_ids,p.user_id in following_ids,_hashtags(db,p),source_id in reposted_ids,source_id in bookmarked_ids,db.query(Bookmark).filter(Bookmark.post_id==source_id).count()))
+        user_results=[]
+        for u in users:
+            item=public_user_json(u); item["followers"]=db.query(Follow).filter(Follow.following_id==u.id).count(); user_results.append(item)
+        return {"success":True,"users":user_results,"posts":result}
     finally: db.close()
 
 
@@ -1192,10 +1285,18 @@ def promote_post(post_id:int=Form(...),credits:int=Form(BOOST_COST),authorizatio
 
 
 @app.get("/music-hub")
-def music_hub():
+def music_hub(authorization:str|None=Header(default=None)):
+    viewer=None
+    if authorization:
+        try: viewer=current_user(authorization)
+        except HTTPException: pass
     db=SessionLocal()
     try:
-        rows=db.query(MusicTrack).order_by(MusicTrack.uses.desc(),MusicTrack.id.desc()).limit(100).all(); return {"success":True,"tracks":[{"id":r.id,"owner_id":r.owner_id,"title":r.title,"artist":r.artist,"audio_url":r.audio_url,"cover_url":r.cover_url or "","uses":r.uses or 0,"audio_available":(UPLOAD_DIR/Path(r.audio_url or "").name).is_file(),"created_at":r.created_at.isoformat() if r.created_at else None} for r in rows]}
+        if viewer:
+            rows=db.query(MusicTrack).filter(or_(MusicTrack.verification_status=="verified",MusicTrack.owner_id==viewer.id)).order_by(MusicTrack.uses.desc(),MusicTrack.id.desc()).limit(100).all()
+        else:
+            rows=db.query(MusicTrack).filter(MusicTrack.verification_status=="verified").order_by(MusicTrack.uses.desc(),MusicTrack.id.desc()).limit(100).all()
+        return {"success":True,"tracks":[_music_track_json(r) | {"audio_available":(UPLOAD_DIR/Path(r.audio_url or "").name).is_file()} for r in rows]}
     finally: db.close()
 
 
@@ -1212,16 +1313,48 @@ def music_track_audio(track_id:int):
 
 
 @app.post("/music-hub/upload")
-async def upload_music_hub(title:str=Form(...),audio:UploadFile=File(...),authorization:str|None=Header(default=None)):
+async def upload_music_hub(
+    title:str=Form(...), artist:str=Form(""), isrc:str=Form(""), owner_confirmed:bool=Form(False),
+    audio:UploadFile=File(...), cover:UploadFile=File(...), proof:UploadFile|None=File(None),
+    authorization:str|None=Header(default=None)
+):
     user=current_user(authorization)
+    if not owner_confirmed: raise HTTPException(400,"Confirm song ownership before uploading.")
     if not audio.content_type or not audio.content_type.startswith("audio/"): raise HTTPException(400,"Please choose an audio file.")
-    data=await audio.read(25*1024*1024+1)
-    if len(data)>25*1024*1024: raise HTTPException(413,"Audio file is too large (max 25 MB).")
-    ext=Path(audio.filename or "song.mp3").suffix.lower() or ".mp3"; name=f"song_{uuid.uuid4().hex}{ext}"; path=UPLOAD_DIR/name; path.write_bytes(data); db=SessionLocal()
+    if not cover.content_type or not cover.content_type.startswith("image/"): raise HTTPException(400,"Please choose a cover image.")
+    db=SessionLocal(); created=[]
     try:
-        row=db.query(User).filter(User.id==user.id).first(); _spend_coins(row,MUSIC_UPLOAD_COST); track=MusicTrack(owner_id=user.id,title=title.strip()[:120],artist=user.username,audio_url=f"/uploads/{name}"); db.add(track); db.commit(); db.refresh(track); return {"success":True,"credits":public_credits(row),"upload_cost":MUSIC_UPLOAD_COST,"track":{"id":track.id,"title":track.title,"artist":track.artist,"audio_url":track.audio_url,"uses":0}}
-    except Exception: db.rollback(); path.unlink(missing_ok=True); raise
-    finally: db.close()
+        audio_data=await audio.read(25*1024*1024+1)
+        if len(audio_data)>25*1024*1024: raise HTTPException(413,"Audio file is too large (max 25 MB).")
+        cover_data=await cover.read(8*1024*1024+1)
+        if len(cover_data)>8*1024*1024: raise HTTPException(413,"Cover is too large (max 8 MB).")
+        proof_data=await proof.read(15*1024*1024+1) if proof else b""
+        if len(proof_data)>15*1024*1024: raise HTTPException(413,"Proof file is too large (max 15 MB).")
+        def save_blob(prefix, upload, data, default_ext):
+            ext=Path(upload.filename or default_ext).suffix.lower() or default_ext
+            name=f"{prefix}_{uuid.uuid4().hex}{ext}"; path=UPLOAD_DIR/name; path.write_bytes(data); created.append(path); return f"/uploads/{name}"
+        audio_url=save_blob("song",audio,audio_data,".mp3")
+        cover_url=save_blob("cover",cover,cover_data,".jpg")
+        proof_url=save_blob("proof",proof,proof_data,".bin") if proof and proof_data else ""
+        digest=hashlib.sha256(audio_data).hexdigest()
+        duplicate=db.query(MusicTrack).filter(MusicTrack.audio_sha256==digest).first()
+        row=MusicTrack(owner_id=user.id,title=title.strip()[:120],artist=artist.strip()[:120] or user.username,audio_url=audio_url,cover_url=cover_url,uses=0,isrc=isrc.strip()[:40],ownership_confirmed=1,verification_status="pending",verification_notes="Pending platform owner review.",identity_match=1 if artist.strip().lower()==user.username.strip().lower() else 0,proof_url=proof_url,audio_sha256=digest,fingerprint_match_id=duplicate.id if duplicate else None)
+        db.add(row); db.commit(); db.refresh(row)
+        return {"success":True,"message":"Song submitted for ownership verification.","track":{"id":row.id,"title":row.title,"artist":row.artist,"audio_url":row.audio_url,"cover_url":row.cover_url,"uses":0,"verification_status":row.verification_status}}
+    except HTTPException:
+        db.rollback()
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        db.rollback()
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        await audio.close(); await cover.close()
+        if proof: await proof.close()
+        db.close()
 
 
 @app.delete("/music-hub/{track_id}")
@@ -1231,7 +1364,10 @@ def delete_music_track(track_id:int,authorization:str|None=Header(default=None))
         track=db.query(MusicTrack).filter(MusicTrack.id==track_id).first()
         if not track: raise HTTPException(404,"Song not found.")
         if track.owner_id!=user.id and not is_owner(user): raise HTTPException(403,"You can only delete your own uploaded songs.")
-        local=UPLOAD_DIR/Path(track.audio_url or "").name; db.delete(track); db.commit(); local.unlink(missing_ok=True); return {"success":True,"track_id":track_id}
+        locals_to_delete=[UPLOAD_DIR/Path(x or "").name for x in (track.audio_url,track.cover_url,track.proof_url)]
+        db.delete(track); db.commit()
+        for local in locals_to_delete: local.unlink(missing_ok=True)
+        return {"success":True,"track_id":track_id}
     finally: db.close()
 
 
@@ -1246,6 +1382,43 @@ def use_music_track(track_id:int,authorization:str|None=Header(default=None)):
         db.commit(); return {"success":True,"uses":track.uses,"track":track.title,"audio_url":track.audio_url}
     finally: db.close()
 
+
+def _music_track_json(r):
+    return {"id":r.id,"owner_id":r.owner_id,"title":r.title,"artist":r.artist,"audio_url":r.audio_url,"cover_url":r.cover_url or "","uses":r.uses or 0,"isrc":r.isrc or "","ownership_confirmed":bool(r.ownership_confirmed),"verification_status":r.verification_status or "pending","verification_notes":r.verification_notes or "","identity_match":bool(r.identity_match),"proof_submitted":bool(r.proof_url),"fingerprint_match_id":r.fingerprint_match_id,"verified_at":r.verified_at.isoformat() if r.verified_at else None,"proof_url":r.proof_url or "","audio_sha256":r.audio_sha256 or "","created_at":r.created_at.isoformat() if r.created_at else None}
+
+@app.get("/owner/music-verifications")
+def owner_music_verifications(authorization:str|None=Header(default=None)):
+    me=current_user(authorization)
+    if not is_owner(me): raise HTTPException(403,"Only the platform owner can review music ownership.")
+    db=SessionLocal()
+    try:
+        rows=db.query(MusicTrack).order_by(MusicTrack.id.desc()).limit(500).all()
+        summary={"pending":sum(1 for r in rows if (r.verification_status or "pending")=="pending"),"verified":sum(1 for r in rows if (r.verification_status or "").lower()=="verified"),"rejected":sum(1 for r in rows if (r.verification_status or "").lower()=="rejected"),"total":len(rows)}
+        return {"success":True,"summary":summary,"tracks":[_music_track_json(r) for r in rows]}
+    finally: db.close()
+
+@app.post("/owner/music-verifications/{track_id}/confirm")
+def confirm_owner_music(track_id:int,authorization:str|None=Header(default=None)):
+    me=current_user(authorization)
+    if not is_owner(me): raise HTTPException(403,"Only the platform owner can verify music.")
+    db=SessionLocal()
+    try:
+        row=db.query(MusicTrack).filter(MusicTrack.id==track_id).first()
+        if not row: raise HTTPException(404,"Song not found.")
+        row.verification_status="verified"; row.verification_notes="Verified by the MusicSocial platform owner."; row.verified_at=datetime.utcnow(); row.identity_match=1 if row.identity_match else 0
+        db.commit(); return {"success":True,"track":_music_track_json(row)}
+    finally: db.close()
+
+@app.post("/owner/music-verifications/{track_id}/reject")
+def reject_owner_music(track_id:int,reason:str=Form("Rejected by platform owner."),authorization:str|None=Header(default=None)):
+    me=current_user(authorization)
+    if not is_owner(me): raise HTTPException(403,"Only the platform owner can reject music.")
+    db=SessionLocal()
+    try:
+        row=db.query(MusicTrack).filter(MusicTrack.id==track_id).first()
+        if not row: raise HTTPException(404,"Song not found.")
+        row.verification_status="rejected"; row.verification_notes=reason[:500]; row.verified_at=None; db.commit(); return {"success":True,"track":_music_track_json(row)}
+    finally: db.close()
 
 @app.get("/drafts")
 def list_drafts(authorization:str|None=Header(default=None)):
@@ -1555,7 +1728,10 @@ def admin_dashboard(authorization:str|None=Header(default=None)):
     if not is_owner(me): raise HTTPException(403,"Only the platform owner can open this dashboard.")
     db=SessionLocal()
     try:
-        paid=db.query(PaymentTransaction).filter(PaymentTransaction.status=="success").all(); return {"success":True,"revenue_naira":sum(t.amount_naira for t in paid),"credits_sold":sum(t.credits for t in paid),"users":db.query(User).count(),"posts":db.query(Post).count(),"referral_rewards":db.query(ReferralReward).count(),"gift_coins_sent":sum(g.coins for g in db.query(CreatorGift).all()),"withdrawal_requests":db.query(WithdrawalRequest).count(),"reports":db.query(Report).count(),"verification_requests":db.query(VerificationRequest).count()}
+        paid=db.query(PaymentTransaction).filter(PaymentTransaction.status=="success").all()
+        withdrawal_rows=db.query(WithdrawalRequest).order_by(WithdrawalRequest.id.desc()).limit(200).all()
+        withdrawals=[{"id":w.id,"username":(db.query(User).filter(User.id==w.user_id).first().username if db.query(User).filter(User.id==w.user_id).first() else ""),"amount_naira":w.amount_naira,"fee_naira":w.fee_naira,"net_naira":w.net_naira,"reserved_coins":int(w.amount_naira/CREATOR_COIN_NAIRA),"status":w.status,"bank_name":w.bank_name,"account_name":w.account_name,"account_number":w.account_number,"rejection_reason":getattr(w,"rejection_reason","") or "","created_at":w.created_at.isoformat() if w.created_at else ""} for w in withdrawal_rows]
+        return {"success":True,"revenue_naira":sum(t.amount_naira for t in paid),"credits_sold":sum(t.credits for t in paid),"credits_spent_on_boosts":sum((p.credits or 0) for p in db.query(Promotion).all()),"successful_payments":len(paid),"users":db.query(User).count(),"posts":db.query(Post).count(),"referral_rewards":db.query(ReferralReward).count(),"gift_coins_sent":sum(g.coins for g in db.query(CreatorGift).all()),"withdrawal_requests":len(withdrawal_rows),"withdrawals":withdrawals,"reports":db.query(Report).count(),"verification_requests":db.query(VerificationRequest).count()}
     finally: db.close()
 
 
